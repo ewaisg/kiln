@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { copyText, downloadText, toPreviewDocument } from "@/lib/preview-doc";
+import { highlightCode } from "@/lib/highlight";
 
 type Piece = { type: "text"; text: string } | { type: "code"; lang: string; code: string };
 
@@ -194,7 +195,7 @@ function Fence({
         </div>
       </div>
       <pre className="overflow-x-auto p-3 font-mono text-sm leading-relaxed">
-        <code>{code}</code>
+        <code dangerouslySetInnerHTML={{ __html: highlightCode(code) }} />
       </pre>
     </div>
   );

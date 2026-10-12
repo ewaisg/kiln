@@ -43,10 +43,22 @@ export function readChatBody(raw: string): RelayChatBody {
   const messages: WireMessage[] = [];
   for (const item of body.messages.slice(-40)) {
     if (!item || typeof item !== "object") continue;
-    const message = item as { role?: unknown; content?: unknown };
+    const message = item as { role?: unknown; content?: unknown; images?: unknown };
     if (message.role !== "system" && message.role !== "user" && message.role !== "assistant") continue;
     if (typeof message.content !== "string") continue;
-    messages.push({ role: message.role, content: message.content.slice(0, 100_000) });
+    const images = Array.isArray(message.images)
+      ? message.images
+          .slice(0, 2)
+          .map((image) => {
+            if (!image || typeof image !== "object") return null;
+            const row = image as { mime?: unknown; data?: unknown };
+            if (row.mime !== "image/jpeg" && row.mime !== "image/png" && row.mime !== "image/webp") return null;
+            if (typeof row.data !== "string" || row.data.length > 350_000) return null;
+            return { mime: row.mime, data: row.data };
+          })
+          .filter((image): image is { mime: string; data: string } => image !== null)
+      : undefined;
+    messages.push({ role: message.role, content: message.content.slice(0, 100_000), images });
   }
   if (!messages.some((message) => message.role === "user")) throw new Error("Write a message first.");
   return {

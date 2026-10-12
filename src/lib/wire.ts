@@ -122,15 +122,37 @@ function withVersion(url: string, apiVersion: string): string {
   return parsed.toString();
 }
 
-function coalesce(messages: WireMessage[]): { role: "user" | "assistant"; content: string }[] {
-  const out: { role: "user" | "assistant"; content: string }[] = [];
+function messageContent(message: WireMessage, anthropic: boolean): string | unknown[] {
+  const images = message.images ?? [];
+  if (images.length === 0) return message.content;
+  if (anthropic) {
+    return [
+      ...(message.content.trim() ? [{ type: "text", text: message.content }] : []),
+      ...images.map((image) => ({
+        type: "image",
+        source: { type: "base64", media_type: image.mime, data: image.data },
+      })),
+    ];
+  }
+  return [
+    { type: "text", text: message.content || "Look at the attached image." },
+    ...images.map((image) => ({
+      type: "image_url",
+      image_url: { url: `data:${image.mime};base64,${image.data}` },
+    })),
+  ];
+}
+
+function coalesce(messages: WireMessage[]): { role: "user" | "assistant"; content: string | unknown[] }[] {
+  const out: { role: "user" | "assistant"; content: string | unknown[] }[] = [];
   for (const message of messages) {
     if (message.role !== "user" && message.role !== "assistant") continue;
-    const content = message.content.trim();
-    if (!content) continue;
+    const content = messageContent(message, true);
+    if (typeof content === "string" && !content.trim()) continue;
     const prev = out[out.length - 1];
-    if (prev && prev.role === message.role) prev.content += `\n\n${content}`;
-    else out.push({ role: message.role, content });
+    if (prev && prev.role === message.role && typeof prev.content === "string" && typeof content === "string") {
+      prev.content += `\n\n${content}`;
+    } else out.push({ role: message.role, content });
   }
   if (out[0]?.role === "assistant") out.unshift({ role: "user", content: "Continue." });
   return out;
@@ -181,8 +203,8 @@ export function buildChatRequest(
   }
 
   const chatMessages = messages
-    .filter((message) => message.content.trim())
-    .map((message) => ({ role: message.role, content: message.content }));
+    .filter((message) => message.content.trim() || (message.images && message.images.length > 0))
+    .map((message) => ({ role: message.role, content: messageContent(message, false) }));
 
   if (kind === "azure-openai") {
     const deployment = model || "deployment";

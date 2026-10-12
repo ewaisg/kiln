@@ -25,6 +25,14 @@ export type Endpoint = {
 export type WireMessage = {
   role: "system" | "user" | "assistant";
   content: string;
+  images?: { mime: string; data: string }[];
+};
+
+export type Attachment = {
+  id: string;
+  name: string;
+  kind: "text" | "image" | "audio" | "video" | "file";
+  detail: string;
 };
 
 export type ChatMessage = {
@@ -32,6 +40,8 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   error?: boolean;
+  attachments?: Attachment[];
+  media?: { id: string; alt: string }[];
 };
 
 export type WorkMode = "chat" | "build";
@@ -43,6 +53,19 @@ export type Thread = {
   updatedAt: number;
   via?: string;
   mode?: WorkMode;
+  folderId?: string;
+};
+
+export type Folder = {
+  id: string;
+  name: string;
+};
+
+export type McpServer = {
+  id: string;
+  name: string;
+  url: string;
+  token: string;
 };
 
 export type Settings = {
@@ -51,6 +74,7 @@ export type Settings = {
   temperature: number;
   maxTokens: number;
   localCtx: number;
+  theme: "dark" | "light";
 };
 
 export type Preset = {
@@ -79,6 +103,7 @@ export const DEFAULT_SETTINGS: Settings = {
   temperature: 0.4,
   maxTokens: 1600,
   localCtx: 2048,
+  theme: "dark",
 };
 
 export const PRESETS: Preset[] = [
@@ -206,6 +231,8 @@ export type SavedModel = {
   url: string;
   bytes: number;
   opfsName: string;
+  externalName?: string;
+  where?: string;
   createdAt: number;
 };
 

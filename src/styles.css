@@ -28,6 +28,34 @@
   --text-2xl: 2rem;
 }
 
+[data-theme="light"] {
+  color-scheme: light;
+  --color-canvas: #f2f3f5;
+  --color-elevated: #ffffff;
+  --color-subtle: #e6e8ec;
+  --color-ink: #141518;
+  --color-muted: #3c424a;
+  --color-faint: #5c636c;
+  --color-line: #d5d8de;
+  --color-accent: #141518;
+  --color-accent-ink: #f2f3f5;
+  --color-danger: #8f2d2d;
+}
+
+.tok-k {
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+.tok-s {
+  color: var(--color-muted);
+}
+
+.tok-c {
+  color: var(--color-faint);
+  font-style: italic;
+}
+
 @layer base {
   html {
     color-scheme: dark;
@@ -76,8 +104,32 @@
   padding-bottom: env(safe-area-inset-bottom);
 }
 
-.press:active {
-  transform: scale(0.98);
+.meter {
+  height: 0.25rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--color-line);
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  transform-origin: left center;
+  background: var(--color-ink);
+}
+
+.meter > span[data-busy="true"] {
+  width: 40%;
+  animation: kiln-meter 1s ease-in-out infinite;
+}
+
+@keyframes kiln-meter {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
 }
 
 .spin {
@@ -186,7 +238,8 @@
   .caret,
   .writing span,
   .sheet,
-  .sheet-side {
+  .sheet-side,
+  .meter > span[data-busy="true"] {
     animation: none;
   }
 

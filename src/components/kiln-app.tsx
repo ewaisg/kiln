@@ -1,19 +1,31 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { formatDistanceToNow } from "date-fns";
 import { Markdown } from "@/components/markdown-view";
+import { StoredImage } from "@/components/stored-image";
+import { ToolsPanel } from "@/components/tools-panel";
 import { isAbort, kindNeedsKey, listRemoteModels, streamChat } from "@/lib/cloud";
+import { huggingFaceUrl } from "@/lib/fetch-model";
+import { base64ToBlob, requestImage } from "@/lib/images";
 import {
+  copyFileToFolder,
   deleteModelRecord,
   deleteOpfs,
+  downloadIntoStorage,
+  fileForModel,
+  folderLabel,
   holdSessionFile,
   isGguf,
   listModels,
+  rememberFolder,
+  saveMedia,
   saveModel,
-  writeOpfs,
+  storeModelBlob,
 } from "@/lib/library";
 import { completeLocal, ensureLocal, isLoadCancelled, planRuntime, unloadLocal } from "@/lib/local-engine";
-import { copyText } from "@/lib/preview-doc";
+import { copyText, downloadText } from "@/lib/preview-doc";
 import { useKiln, threadMode } from "@/lib/store";
+import { composeAttachmentText, prepareFile, type PreparedFile } from "@/lib/attachments";
+import { speak, speechInputAvailable, speechOutputAvailable, startDictation, stopSpeaking } from "@/lib/speech";
 import {
   CATALOG,
   CHAT_SYSTEM,
@@ -31,7 +43,7 @@ import { endpointLabel, fitMessages, shouldDirect } from "@/lib/wire";
 import { downloadWindowsInstaller, isWindowsDevice } from "@/lib/windows-install";
 
 type Panel = "threads" | "library" | null;
-type Tab = "endpoints" | "models" | "studio";
+type Tab = "endpoints" | "models" | "tools" | "studio";
 type LoadState =
   | { phase: "idle" }
   | { phase: "loading"; label: string; ratio: number | null }
@@ -41,6 +53,14 @@ type LoadState =
 type InstallPrompt = Event & {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: string }>;
+};
+
+type FileSlot = {
+  key: string;
+  name: string;
+  progress: number;
+  file?: PreparedFile;
+  preview?: string;
 };
 
 const BUILD_STARTERS = [
@@ -101,7 +121,22 @@ export function KilnApp() {
   const [windows, setWindows] = useState(false);
   const [standalone, setStandalone] = useState(false);
   const [editing, setEditing] = useState<Endpoint | null>(null);
+  const [files, setFiles] = useState<FileSlot[]>([]);
+  const [fileNote, setFileNote] = useState("");
+  const [listening, setListening] = useState(false);
+  const [speechIn, setSpeechIn] = useState(false);
+  const [speechOut, setSpeechOut] = useState(false);
+  const [query, setQuery] = useState("");
+  const [folderId, setFolderId] = useState<string | "all">("all");
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [draw, setDraw] = useState(false);
+  const [over, setOver] = useState(false);
+  const [modelFolder, setModelFolder] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
+  const micRef = useRef<{ stop: () => void } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const downloadAbort = useRef<AbortController | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const boxRef = useRef<HTMLTextAreaElement>(null);
@@ -117,6 +152,9 @@ export function KilnApp() {
       if (next !== state.mode) useKiln.setState({ mode: next });
     });
     void refreshModels();
+    void folderLabel().then(setModelFolder).catch(() => undefined);
+    setSpeechIn(speechInputAvailable());
+    setSpeechOut(speechOutputAvailable());
     const onPrompt = (event: Event) => {
       event.preventDefault();
       setInstall(event as InstallPrompt);
@@ -135,6 +173,10 @@ export function KilnApp() {
       display.removeEventListener("change", syncDisplay);
     };
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = kiln.settings.theme ?? "dark";
+  }, [kiln.settings.theme]);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -158,21 +200,84 @@ export function KilnApp() {
   async function activate(model: SavedModel) {
     kiln.setLocalModelId(model.id);
     setPanel(null);
+    const controller = new AbortController();
+    downloadAbort.current = controller;
     setLoad({ phase: "loading", label: "Starting", ratio: null });
     try {
-      await ensureLocal(model, useKiln.getState().settings.localCtx, (label, ratio) => {
+      const ready = await materialize(model, controller.signal);
+      await ensureLocal(ready, useKiln.getState().settings.localCtx, (label, ratio) => {
         setLoad({ phase: "loading", label, ratio });
       });
-      setLoad({ phase: "ready", name: model.name, note: planRuntime(useKiln.getState().settings.localCtx, 512).note });
+      setLoad({ phase: "ready", name: ready.name, note: planRuntime(useKiln.getState().settings.localCtx, 512).note });
+      await refreshModels();
     } catch (error) {
-      if (isLoadCancelled(error)) return;
+      if (isAbort(error) || isLoadCancelled(error)) {
+        setLoad({ phase: "idle" });
+        return;
+      }
       setLoad({ phase: "error", message: explain(error) });
+    } finally {
+      if (downloadAbort.current === controller) downloadAbort.current = null;
+    }
+  }
+
+  async function materialize(model: SavedModel, signal: AbortSignal): Promise<SavedModel> {
+    if (model.kind === "file" || model.opfsName || model.externalName) return model;
+    const url = model.kind === "hf" ? huggingFaceUrl(model.repo, model.file) : model.url;
+    if (!url) throw new Error("That model has no download link.");
+    setLoad({ phase: "loading", label: "Downloading", ratio: 0 });
+    const placed = await downloadIntoStorage(url, model.file || `${model.name}.gguf`, signal, (ratio) => {
+      setLoad({ phase: "loading", label: "Downloading", ratio });
+    });
+    const next: SavedModel = {
+      ...model,
+      kind: "file",
+      bytes: placed.bytes,
+      opfsName: placed.opfsName,
+      externalName: placed.externalName || undefined,
+      where: placed.where,
+    };
+    await saveModel(next);
+    return next;
+  }
+
+  async function addFiles(list: FileList) {
+    setFileNote("");
+    const incoming = Array.from(list).slice(0, 4);
+    let room = 4 - files.length;
+    for (const file of incoming) {
+      if (room <= 0) break;
+      room -= 1;
+      const key = newId();
+      const preview = file.type.startsWith("image/") || file.type.startsWith("audio/") || file.type.startsWith("video/")
+        ? URL.createObjectURL(file)
+        : undefined;
+      setFiles((current) => [...current, { key, name: file.name, progress: 0.05, preview }].slice(0, 4));
+      try {
+        const prepared = await prepareFile(file, (ratio) => {
+          setFiles((current) => current.map((slot) => (slot.key === key ? { ...slot, progress: ratio } : slot)));
+        });
+        setFiles((current) =>
+          current.map((slot) => (slot.key === key ? { ...slot, progress: 1, file: prepared } : slot)),
+        );
+      } catch (error) {
+        setFiles((current) => current.filter((slot) => slot.key !== key));
+        if (preview) URL.revokeObjectURL(preview);
+        setFileNote(error instanceof Error ? error.message : "Could not read that file.");
+      }
     }
   }
 
   async function sendText(text: string, again = false) {
     const trimmed = text.trim();
-    if (!trimmed || busy) return;
+    const attachedNow = files.flatMap((slot) => (slot.file ? [slot.file] : []));
+    if (busy) return;
+    if (files.some((slot) => !slot.file)) {
+      setFileNote("Still reading a file.");
+      return;
+    }
+    if (!trimmed && attachedNow.length === 0) return;
+    const spoken = trimmed || "Look at the attached files.";
     const state = useKiln.getState();
     const threadId = state.activeThreadId;
     const active = state.endpoints.find((item) => item.id === state.activeId);
@@ -194,10 +299,27 @@ export function KilnApp() {
       return;
     }
 
+    const attached = again ? [] : attachedNow;
+    const extra = composeAttachmentText(attached);
+    const userContent = `${spoken}${extra}`;
+    const images = attached.flatMap((item) => (item.image ? [item.image] : []));
+
     if (!again) {
-      state.appendMessage(threadId, { id: newId(), role: "user", content: trimmed });
-      state.titleIfBlank(threadId, clipTitle(trimmed));
+      state.appendMessage(threadId, {
+        id: newId(),
+        role: "user",
+        content: userContent,
+        attachments: attached.map((item) => item.attachment),
+      });
+      state.titleIfBlank(threadId, clipTitle(spoken));
       setDraft("");
+      setFiles((current) => {
+        current.forEach((slot) => {
+          if (slot.preview) URL.revokeObjectURL(slot.preview);
+        });
+        return [];
+      });
+      setFileNote("");
       if (boxRef.current) boxRef.current.style.height = "auto";
     }
 
@@ -209,11 +331,16 @@ export function KilnApp() {
     useKiln.getState().appendMessage(threadId, { id: assistantId, role: "assistant", content: "" }, via);
     setLive({ id: assistantId, content: "" });
 
-    const history = useKiln
-      .getState()
-      .threads.find((item) => item.id === threadId)
-      ?.messages.filter((message) => message.id !== assistantId && message.content.trim() && !message.error)
-      .map((message) => ({ role: message.role, content: message.content })) ?? [];
+    const history: { role: "user" | "assistant"; content: string; images?: { mime: string; data: string }[] }[] =
+      useKiln
+        .getState()
+        .threads.find((item) => item.id === threadId)
+        ?.messages.filter((message) => message.id !== assistantId && message.content.trim() && !message.error)
+        .map((message) => ({ role: message.role, content: message.content })) ?? [];
+    if (!again && images.length && history.length > 0) {
+      const last = history[history.length - 1];
+      if (last && last.role === "user") last.images = images;
+    }
     const settings = useKiln.getState().settings;
     const mode = threadMode(
       useKiln.getState().threads.find((item) => item.id === threadId),
@@ -246,7 +373,13 @@ export function KilnApp() {
         const plan = planRuntime(settings.localCtx, settings.maxTokens);
         await ensureLocal(saved, plan.ctx, (label, ratio) => setLoad({ phase: "loading", label, ratio }));
         setLoad({ phase: "ready", name: saved.name, note: plan.note });
-        await completeLocal(messages, settings.temperature, plan.maxTokens, controller.signal, paint);
+        await completeLocal(
+          messages.map(({ role, content }) => ({ role, content })),
+          settings.temperature,
+          plan.maxTokens,
+          controller.signal,
+          paint,
+        );
       } else if (active) {
         await streamChat({
           endpoint: active,
@@ -279,6 +412,45 @@ export function KilnApp() {
     }
   }
 
+  async function drawPicture(text: string) {
+    const prompt = text.trim();
+    const active = useKiln.getState().endpoints.find((item) => item.id === useKiln.getState().activeId);
+    if (busy || !prompt || !active) return;
+    if ((active.kind !== "openai" && active.kind !== "grok") || !active.apiKey.trim() || shouldDirect(active)) return;
+    const threadId = useKiln.getState().activeThreadId;
+    useKiln.getState().appendMessage(threadId, { id: newId(), role: "user", content: prompt });
+    useKiln.getState().titleIfBlank(threadId, clipTitle(prompt));
+    setDraft("");
+    const assistantId = newId();
+    useKiln.getState().appendMessage(threadId, { id: assistantId, role: "assistant", content: "" }, active.name);
+    setLive({ id: assistantId, content: "" });
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+    try {
+      const image = await requestImage(active, prompt, controller.signal);
+      const id = newId();
+      await saveMedia(id, base64ToBlob(image.mime, image.data));
+      useKiln.getState().updateMessage(threadId, assistantId, {
+        content: `Picture from ${active.name}.`,
+        media: [{ id, alt: prompt }],
+      });
+    } catch (error) {
+      if (isAbort(error)) useKiln.getState().removeMessage(threadId, assistantId);
+      else {
+        useKiln.getState().updateMessage(threadId, assistantId, {
+          content: `Error: ${explain(error)}`,
+          error: true,
+        });
+      }
+    } finally {
+      setLive(null);
+      setBusy(false);
+      abortRef.current = null;
+      setDraw(false);
+    }
+  }
+
   function regenerate() {
     if (!thread || busy) return;
     const last = thread.messages[thread.messages.length - 1];
@@ -297,11 +469,39 @@ export function KilnApp() {
           ? `${load.name} is ready. ${load.note}`
           : "";
 
+  const canDraw = Boolean(
+    endpoint && (endpoint.kind === "openai" || endpoint.kind === "grok") && endpoint.apiKey.trim() && !shouldDirect(endpoint),
+  );
   const mode = threadMode(thread, kiln.mode);
-  const visibleThreads = kiln.threads.filter((item) => threadMode(item, "build") === mode);
+  const visibleThreads = kiln.threads.filter((item) => {
+    if (threadMode(item, "build") !== mode) return false;
+    if (folderId !== "all" && item.folderId !== folderId) return false;
+    if (!query.trim()) return true;
+    const haystack = `${item.title}\n${item.messages.map((message) => message.content).join("\n")}`.toLowerCase();
+    return haystack.includes(query.trim().toLowerCase());
+  });
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-canvas text-ink">
+    <div
+      className="flex h-dvh overflow-hidden bg-canvas text-ink"
+      onDragEnter={(event) => {
+        if (event.dataTransfer.types.includes("Files")) setOver(true);
+      }}
+      onDragOver={(event) => {
+        if (event.dataTransfer.types.includes("Files")) {
+          event.preventDefault();
+          setOver(true);
+        }
+      }}
+      onDragLeave={(event) => {
+        if (event.currentTarget === event.target) setOver(false);
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        setOver(false);
+        if (event.dataTransfer.files.length) void addFiles(event.dataTransfer.files);
+      }}
+    >
       <aside className="hidden w-72 shrink-0 flex-col border-r border-line lg:flex">
         <ThreadPane
           threads={visibleThreads}
@@ -320,6 +520,10 @@ export function KilnApp() {
           onInstall={() => void install?.prompt()}
           windows={windows}
           standalone={standalone}
+          query={query}
+          onQuery={setQuery}
+          folderId={folderId}
+          onFolder={setFolderId}
         />
       </aside>
 
@@ -396,27 +600,86 @@ export function KilnApp() {
                 <article key={message.id} className={message.role === "user" ? "ml-auto max-w-prose" : "max-w-3xl"}>
                   <div className="mb-1 text-xs font-medium text-faint">{message.role === "user" ? "You" : "Kiln"}</div>
                   <div className={message.role === "user" ? "rounded-lg bg-subtle px-4 py-3" : ""}>
-                    {message.role === "assistant" ? (
+                  {message.role === "user" && editId === message.id ? (
+                    <form
+                      className="flex flex-col gap-2"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        if (!thread || !editDraft.trim() || busy) return;
+                        kiln.truncateFrom(thread.id, message.id);
+                        setEditId(null);
+                        void sendText(editDraft.trim());
+                      }}
+                    >
+                      <textarea
+                        value={editDraft}
+                        onChange={(event) => setEditDraft(event.target.value)}
+                        className="min-h-20 w-full rounded-md border border-line bg-canvas px-3 py-2 text-base"
+                      />
+                      <div className="flex gap-2">
+                        <button type="submit" className="press h-11 rounded-md bg-accent px-3 text-sm font-medium text-accent-ink">
+                          Save and send
+                        </button>
+                        <button type="button" className="press h-11 rounded-md px-3 text-sm" onClick={() => setEditId(null)}>
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  ) : message.role === "assistant" ? (
                       message.error ? (
                         <p className="text-danger">{content}</p>
                       ) : content ? (
                         <Markdown text={content} onPreview={openPreview} />
                       ) : streaming ? (
-                        <Writing />
+                        <Writing label={draw ? "Drawing" : "Thinking"} />
                       ) : null
                     ) : (
                       <p className="whitespace-pre-wrap">{content}</p>
                     )}
                     {streaming && content ? <span className="caret" /> : null}
+                    {message.media?.map((item) => (
+                      <StoredImage key={item.id} id={item.id} alt={item.alt} />
+                    ))}
+                    {message.attachments?.map((item) => (
+                      <p key={item.id} className="mt-2 text-xs text-faint">
+                        {item.name} — {item.detail}
+                      </p>
+                    ))}
                   </div>
-                  {message.role === "assistant" && content && !streaming ? (
+                  {message.role === "user" && editId !== message.id ? (
                     <div className="mt-2 flex gap-2">
+                      <button
+                        type="button"
+                        className="press h-11 rounded-md px-3 text-sm text-muted"
+                        onClick={() => {
+                          setEditId(message.id);
+                          setEditDraft(message.content);
+                        }}
+                      >
+                        Edit
+                      </button>
+                    </div>
+                  ) : null}
+                  {message.role === "assistant" && content && !streaming ? (
+                    <div className="mt-2 flex flex-wrap gap-2">
                       <button
                         type="button"
                         className="press h-11 rounded-md px-3 text-sm text-muted"
                         onClick={() => void copyText(content)}
                       >
                         Copy
+                      </button>
+                      {speechOut ? (
+                        <button type="button" className="press h-11 rounded-md px-3 text-sm text-muted" onClick={() => speak(content)}>
+                          Listen
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="press h-11 rounded-md px-3 text-sm text-muted"
+                        onClick={() => downloadText("kiln-reply.md", content)}
+                      >
+                        Export
                       </button>
                       {thread.messages[thread.messages.length - 1]?.id === message.id ? (
                         <button type="button" className="press h-11 rounded-md px-3 text-sm text-muted" onClick={regenerate}>
@@ -435,17 +698,104 @@ export function KilnApp() {
           className="safe-bottom border-t border-line px-3 py-3"
           onSubmit={(event) => {
             event.preventDefault();
-            void sendText(draft);
+            if (draw) void drawPicture(draft);
+            else void sendText(draft);
           }}
         >
-          <div className="mx-auto flex w-full max-w-3xl items-end gap-2">
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+            {files.length > 0 ? (
+              <ul className="flex flex-col gap-2">
+                {files.map((slot) => (
+                  <li key={slot.key} className="rounded-md border border-line px-3 py-2 text-sm">
+                    <div className="flex items-center gap-2">
+                      <span className="min-w-0 flex-1 truncate">
+                        {slot.name}
+                        <span className="text-faint">
+                          {" "}
+                          · {slot.file ? slot.file.attachment.detail : `Reading ${Math.round(slot.progress * 100)}%`}
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        className="press h-11 px-2 text-sm text-muted"
+                        onClick={() => {
+                          if (slot.preview) URL.revokeObjectURL(slot.preview);
+                          setFiles((current) => current.filter((item) => item.key !== slot.key));
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <div className="meter mt-2" aria-hidden>
+                      <span
+                        data-busy={slot.progress >= 1 ? "false" : slot.progress <= 0.05 ? "true" : "false"}
+                        style={{ transform: `scaleX(${Math.max(slot.progress, 0.04)})` }}
+                      />
+                    </div>
+                    {slot.preview && slot.file?.attachment.kind === "image" ? (
+                      <img src={slot.preview} alt="" className="mt-2 max-h-36 rounded-md" />
+                    ) : null}
+                    {slot.preview && slot.file?.attachment.kind === "audio" ? <audio controls src={slot.preview} className="mt-2 w-full" /> : null}
+                    {slot.preview && slot.file?.attachment.kind === "video" ? (
+                      <video controls src={slot.preview} className="mt-2 max-h-40 w-full rounded-md" />
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {fileNote ? <p className="text-sm text-danger">{fileNote}</p> : null}
+            <div className="flex items-end gap-2">
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                const list = event.target.files;
+                event.target.value = "";
+                if (list) void addFiles(list);
+              }}
+            />
+            <button type="button" className="press h-11 shrink-0 rounded-md bg-subtle px-3 text-sm" onClick={() => fileRef.current?.click()}>
+              Attach
+            </button>
+            {canDraw ? (
+              <button
+                type="button"
+                aria-pressed={draw}
+                className={`press h-11 shrink-0 rounded-md px-3 text-sm ${draw ? "bg-accent text-accent-ink" : "bg-subtle"}`}
+                onClick={() => setDraw((value) => !value)}
+              >
+                Draw
+              </button>
+            ) : null}
+            {speechIn ? (
+              <button
+                type="button"
+                className="press h-11 shrink-0 rounded-md bg-subtle px-3 text-sm"
+                onClick={() => {
+                  if (listening) {
+                    micRef.current?.stop();
+                    setListening(false);
+                    return;
+                  }
+                  setListening(true);
+                  micRef.current = startDictation(
+                    (text) => setDraft(text),
+                    () => setListening(false),
+                  );
+                }}
+              >
+                {listening ? "Stop mic" : "Mic"}
+              </button>
+            ) : null}
             <label className="min-w-0 flex-1">
               <span className="sr-only">Message</span>
               <textarea
                 ref={boxRef}
                 value={draft}
                 rows={1}
-                placeholder={mode === "build" ? "Describe what to build" : "Message Kiln"}
+                placeholder={draw ? "Describe the picture" : mode === "build" ? "Describe what to build" : "Message Kiln"}
                 className="max-h-40 w-full resize-none rounded-lg border border-line bg-elevated px-3 py-3 text-base outline-none"
                 onChange={(event) => setDraft(event.target.value)}
                 onInput={(event) => {
@@ -457,7 +807,8 @@ export function KilnApp() {
                   if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
                   if (window.matchMedia("(pointer: coarse)").matches) return;
                   event.preventDefault();
-                  void sendText(draft);
+                  if (draw) void drawPicture(draft);
+                  else void sendText(draft);
                 }}
               />
             </label>
@@ -472,18 +823,30 @@ export function KilnApp() {
             ) : (
               <button
                 type="submit"
-                disabled={!draft.trim()}
+                disabled={
+                  draw
+                    ? !draft.trim()
+                    : (!draft.trim() && files.every((slot) => !slot.file)) || files.some((slot) => !slot.file)
+                }
                 className="press h-11 shrink-0 rounded-md bg-accent px-4 text-sm font-medium text-accent-ink disabled:opacity-40"
               >
-                Send
+                {draw ? "Draw" : "Send"}
               </button>
             )}
+            </div>
           </div>
           <p className="mx-auto mt-2 w-full max-w-3xl text-xs text-faint">
-            Keys stay in this browser. On a phone, Enter adds a line.
+            Keys stay in this browser. Drop a file anywhere to attach it.
+            {canDraw ? " Draw uses your OpenAI or Grok key and bills that account." : " Switch to a saved OpenAI or Grok endpoint to draw a picture."}
           </p>
         </form>
       </div>
+
+      {over ? (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-canvas/80">
+          <p className="rounded-lg border border-line bg-elevated px-6 py-4 text-lg font-medium">Drop to attach</p>
+        </div>
+      ) : null}
 
       {preview ? (
         <section
@@ -526,6 +889,10 @@ export function KilnApp() {
             onInstall={() => void install?.prompt()}
             windows={windows}
             standalone={standalone}
+            query={query}
+            onQuery={setQuery}
+            folderId={folderId}
+            onFolder={setFolderId}
           />
         </Overlay>
       ) : null}
@@ -537,6 +904,7 @@ export function KilnApp() {
               [
                 ["models", "Models"],
                 ["endpoints", "Endpoints"],
+                ["tools", "Tools"],
                 ["studio", "Studio"],
               ] as const
             ).map(([id, label]) => (
@@ -557,7 +925,17 @@ export function KilnApp() {
               load={load}
               onUse={(model) => void activate(model)}
               onChanged={() => void refreshModels()}
+              folder={modelFolder}
+              onFolder={async () => {
+                try {
+                  const name = await rememberFolder();
+                  setModelFolder(name);
+                } catch (error) {
+                  setLoad({ phase: "error", message: explain(error) });
+                }
+              }}
               onUnload={() => {
+                downloadAbort.current?.abort();
                 void unloadLocal();
                 setLoad({ phase: "idle" });
               }}
@@ -581,6 +959,14 @@ export function KilnApp() {
               onDelete={(id) => {
                 kiln.removeEndpoint(id);
                 setEditing(null);
+              }}
+            />
+          ) : null}
+          {tab === "tools" ? (
+            <ToolsPanel
+              onInsert={(text) => {
+                setDraft((current) => (current ? `${current}\n\n${text}` : text));
+                setPanel(null);
               }}
             />
           ) : null}
@@ -627,13 +1013,13 @@ function Overlay({ title, onClose, children }: { title: string; onClose: () => v
   );
 }
 
-function Writing() {
+function Writing({ label = "Thinking" }: { label?: string }) {
   return (
     <p className="writing" role="status">
       <span />
       <span />
       <span />
-      Thinking
+      {label}
     </p>
   );
 }
@@ -676,6 +1062,10 @@ function ThreadPane({
   onInstall,
   windows,
   standalone,
+  query,
+  onQuery,
+  folderId,
+  onFolder,
 }: {
   threads: Thread[];
   activeId: string;
@@ -687,8 +1077,17 @@ function ThreadPane({
   onInstall: () => void;
   windows?: boolean;
   standalone?: boolean;
+  query: string;
+  onQuery: (value: string) => void;
+  folderId: string | "all";
+  onFolder: (value: string | "all") => void;
 }) {
+  const folders = useKiln((state) => state.folders);
+  const addFolder = useKiln((state) => state.addFolder);
+  const setThreadFolder = useKiln((state) => state.setThreadFolder);
   const [armed, setArmed] = useState<string | null>(null);
+  const [naming, setNaming] = useState(false);
+  const [folderName, setFolderName] = useState("");
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-2 px-3 py-3">
@@ -697,7 +1096,54 @@ function ThreadPane({
           {mode === "build" ? "New build" : "New chat"}
         </button>
       </div>
+      <div className="px-3 pb-2">
+        <input
+          value={query}
+          onChange={(event) => onQuery(event.target.value)}
+          placeholder="Search chats"
+          className="h-11 w-full rounded-md border border-line bg-canvas px-3 text-base"
+        />
+        <div className="mt-2 flex gap-2">
+          <select
+            className="h-11 min-w-0 flex-1 rounded-md border border-line bg-canvas px-2 text-sm"
+            value={folderId}
+            onChange={(event) => onFolder(event.target.value)}
+          >
+            <option value="all">All folders</option>
+            {folders.map((folder) => (
+              <option key={folder.id} value={folder.id}>
+                {folder.name}
+              </option>
+            ))}
+          </select>
+          <button type="button" className="press h-11 rounded-md bg-subtle px-3 text-sm" onClick={() => setNaming((value) => !value)}>
+            Folder
+          </button>
+        </div>
+        {naming ? (
+          <form
+            className="mt-2 flex gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (folderName.trim()) addFolder(folderName);
+              setFolderName("");
+              setNaming(false);
+            }}
+          >
+            <input
+              value={folderName}
+              onChange={(event) => setFolderName(event.target.value)}
+              placeholder="Folder name"
+              className="h-11 min-w-0 flex-1 rounded-md border border-line bg-canvas px-3 text-base"
+            />
+            <button type="submit" className="press h-11 rounded-md bg-accent px-3 text-sm font-medium text-accent-ink">
+              Add
+            </button>
+          </form>
+        ) : null}
+      </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2">
+        {threads.length === 0 ? <p className="px-3 py-6 text-sm text-faint">No chats match.</p> : null}
         {threads.map((thread) => (
           <div key={thread.id} className={`mb-1 flex items-stretch rounded-md ${thread.id === activeId ? "bg-subtle" : ""}`}>
             <button type="button" className="min-w-0 flex-1 px-3 py-3 text-left" onClick={() => onSelect(thread.id)}>
@@ -706,6 +1152,21 @@ function ThreadPane({
                 <When at={thread.updatedAt} />
                 {thread.via ? ` · ${thread.via}` : ""}
               </div>
+              {folders.length > 0 ? (
+                <select
+                  className="mt-1 max-w-full bg-transparent text-xs text-faint"
+                  value={thread.folderId ?? ""}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => setThreadFolder(thread.id, event.target.value || null)}
+                >
+                  <option value="">No folder</option>
+                  {folders.map((folder) => (
+                    <option key={folder.id} value={folder.id}>
+                      {folder.name}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
             </button>
             <button
               type="button"
@@ -727,6 +1188,11 @@ function ThreadPane({
   );
 }
 
+function footprint(bytes: number): string {
+  const ram = Math.max(1, Math.ceil((bytes * 2) / 1_000_000_000));
+  return `About ${Math.round(bytes / 1_000_000)} MB on disk. Leave roughly ${ram} GB free. CPU only — the GPU stays off.`;
+}
+
 function When({ at }: { at: number }) {
   const [label, setLabel] = useState("");
   useEffect(() => {
@@ -742,6 +1208,8 @@ function ModelsTab({
   onUse,
   onChanged,
   onUnload,
+  folder,
+  onFolder,
 }: {
   models: SavedModel[];
   activeId: string | null;
@@ -749,9 +1217,13 @@ function ModelsTab({
   onUse: (model: SavedModel) => void;
   onChanged: () => void;
   onUnload: () => void;
+  folder: string;
+  onFolder: () => void;
 }) {
   const [url, setUrl] = useState("");
   const [note, setNote] = useState("");
+  const [modelQuery, setModelQuery] = useState("");
+  const [copyNote, setCopyNote] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const [armed, setArmed] = useState<string | null>(null);
 
@@ -775,7 +1247,11 @@ function ModelsTab({
     };
     try {
       await navigator.storage?.persist?.();
-      await writeOpfs(model.opfsName, file, () => undefined);
+      const placed = await storeModelBlob(file.name, file, () => undefined);
+      model.opfsName = placed.opfsName;
+      model.externalName = placed.externalName || undefined;
+      model.where = placed.where;
+      if (!placed.opfsName && !placed.externalName) throw new Error("Could not store that file.");
     } catch {
       model.opfsName = "";
       holdSessionFile(id, file);
@@ -841,8 +1317,23 @@ function ModelsTab({
     <div className="flex flex-col gap-5">
       <p className="text-sm text-muted">
         Kiln runs GGUF files in this browser with llama.cpp. Nothing is uploaded. Phones do best around 400 MB.
-        The first reply is slow, then it settles.
+        Downloads go to {folder || "browser storage"}. The GPU stays off so replies stay coherent.
       </p>
+      <button type="button" className="press h-11 rounded-md bg-subtle text-sm" onClick={onFolder}>
+        {folder ? `Download folder: ${folder}` : "Choose download folder"}
+      </button>
+      {load.phase === "loading" ? (
+        <button
+          type="button"
+          className="press h-11 rounded-md bg-subtle text-sm"
+          onClick={() => {
+          void unloadLocal();
+          onUnload();
+        }}
+        >
+          Cancel download
+        </button>
+      ) : null}
       {load.phase === "ready" ? (
         <button type="button" className="press h-11 rounded-md bg-subtle text-sm" onClick={onUnload}>
           Unload model and free memory
@@ -850,8 +1341,14 @@ function ModelsTab({
       ) : null}
       <div>
         <h3 className="text-sm font-medium">Suggested downloads</h3>
+        <input
+          value={modelQuery}
+          onChange={(event) => setModelQuery(event.target.value)}
+          placeholder="Search models"
+          className="mt-2 h-11 w-full rounded-md border border-line bg-canvas px-3 text-base"
+        />
         <div className="mt-2 flex flex-col gap-2">
-          {CATALOG.map((item) => (
+          {CATALOG.filter((item) => `${item.name} ${item.blurb}`.toLowerCase().includes(modelQuery.trim().toLowerCase())).map((item) => (
             <button
               key={item.id}
               type="button"
@@ -863,8 +1360,12 @@ function ModelsTab({
                 <span className="shrink-0 font-mono text-xs text-faint">{item.size}</span>
               </div>
               <p className="mt-1 text-sm text-muted">{item.blurb}</p>
+              <p className="mt-1 text-xs text-faint">{footprint(item.bytes)}</p>
             </button>
           ))}
+          {CATALOG.filter((item) => `${item.name} ${item.blurb}`.toLowerCase().includes(modelQuery.trim().toLowerCase())).length === 0 ? (
+            <p className="text-sm text-faint">No models match that search.</p>
+          ) : null}
         </div>
       </div>
       <div>
@@ -896,6 +1397,7 @@ function ModelsTab({
             </button>
           </div>
           {note ? <p className="text-sm text-danger">{note}</p> : null}
+          {copyNote ? <p className="text-sm text-muted">{copyNote}</p> : null}
         </div>
         <div className="mt-3 flex flex-col gap-2">
           {models.length === 0 ? <p className="text-sm text-faint">No models saved yet.</p> : null}
@@ -903,13 +1405,30 @@ function ModelsTab({
             <div key={model.id} className={`rounded-md border border-line px-3 py-3 ${model.id === activeId ? "bg-subtle" : ""}`}>
               <div className="font-medium">{model.name}</div>
               <div className="text-xs text-faint">
-                {model.kind === "file" ? "Imported file" : model.kind === "hf" ? "Downloaded when you use it" : "Link"}
-                {model.opfsName ? "" : model.kind === "file" ? " · this visit only" : ""}
+                {model.where || (model.opfsName ? "Browser storage" : model.kind === "file" ? "This visit only" : "Not downloaded yet")}
                 {model.bytes ? ` · ${Math.round(model.bytes / 1_000_000)} MB` : ""}
               </div>
-              <div className="mt-2 flex gap-2">
+              <div className="mt-2 flex flex-wrap gap-2">
                 <button type="button" className="press h-11 rounded-md bg-accent px-3 text-sm font-medium text-accent-ink" onClick={() => onUse(model)}>
                   Use
+                </button>
+                <button
+                  type="button"
+                  className="press h-11 rounded-md bg-subtle px-3 text-sm"
+                  onClick={() => {
+                    void (async () => {
+                      try {
+                        const blob = await fileForModel(model);
+                        const file = new File([blob], model.file || `${model.name}.gguf`);
+                        const folder = await copyFileToFolder(file);
+                        setCopyNote(`Copied into ${folder}. The running copy stays in browser storage.`);
+                      } catch (error) {
+                        setCopyNote(error instanceof Error ? error.message : "Could not copy that file.");
+                      }
+                    })();
+                  }}
+                >
+                  Copy to folder
                 </button>
                 <button
                   type="button"
@@ -1146,6 +1665,67 @@ function StudioTab({
         Chat is a conversation. Build writes software, and an HTML or JavaScript block can be previewed in a sandbox
         on this page.
       </p>
+      <Field label="Appearance">
+        <div className="flex gap-2">
+          {(["dark", "light"] as const).map((theme) => (
+            <button
+              key={theme}
+              type="button"
+              className={`press h-11 flex-1 rounded-md text-sm font-medium ${(settings.theme ?? "dark") === theme ? "bg-accent text-accent-ink" : "bg-subtle"}`}
+              onClick={() => update({ theme })}
+            >
+              {theme === "dark" ? "Dark" : "Light"}
+            </button>
+          ))}
+        </div>
+      </Field>
+      <button
+        type="button"
+        className="press h-11 self-start rounded-md bg-subtle px-3 text-sm"
+        onClick={() => {
+          stopSpeaking();
+          const fresh = useKiln.getState().newThread();
+          useKiln.setState({
+            threads: useKiln.getState().threads.filter((item) => item.id === fresh),
+            folders: [],
+          });
+        }}
+      >
+        Clear chats on this device
+      </button>
+      <button
+        type="button"
+        className="press h-11 self-start rounded-md bg-subtle px-3 text-sm"
+        onClick={() => {
+          const threads = useKiln.getState().threads;
+          downloadText(
+            "kiln-chats.md",
+            threads
+              .map((item) => `# ${item.title}\n\n${item.messages.map((message) => `## ${message.role}\n\n${message.content}`).join("\n\n")}`)
+              .join("\n\n"),
+          );
+        }}
+      >
+        Export chats
+      </button>
+      <button
+        type="button"
+        className="press h-11 self-start rounded-md px-3 text-sm text-danger"
+        onClick={() => useKiln.getState().clearSecrets()}
+      >
+        Forget API keys and MCP tokens
+      </button>
+      <div className="rounded-md border border-line px-3 py-3 text-sm text-muted">
+        <p className="font-medium text-ink">What this browser build does not do</p>
+        <ul className="mt-2 list-disc space-y-1 pl-5">
+          <li>Kiln cannot launch an MCP process. The Tools tab talks only to an HTTP MCP server you already run.</li>
+          <li>Pictures can be drawn with a saved OpenAI or Grok key. Video generation is not available.</li>
+          <li>Audio and video files play here. They are not transcribed or watched by the model.</li>
+          <li>A chosen download folder works in Chrome or Edge on a computer. Other browsers keep models in browser storage.</li>
+          <li>The GPU stays idle. On a phone, one CPU core is used so the device stays cooler, and replies are capped.</li>
+          <li>Voice input appears only in browsers that provide speech recognition. Listen uses the device voice.</li>
+        </ul>
+      </div>
       <Field label="Chat prompt">
         <textarea
           value={settings.chatPrompt ?? CHAT_SYSTEM}

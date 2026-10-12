@@ -8,6 +8,8 @@ import {
   type Settings,
   type Thread,
   type WorkMode,
+  type Folder,
+  type McpServer,
 } from "@/lib/types";
 
 const WELCOME_ID = "thread-welcome";
@@ -44,6 +46,9 @@ type State = {
   activeThreadId: string;
   settings: Settings;
   mode: WorkMode;
+  folders: Folder[];
+  mcpServers: McpServer[];
+  toolGrants: Record<string, boolean>;
   setMode: (mode: WorkMode) => void;
   setActiveId: (id: string) => void;
   setLocalModelId: (id: string | null) => void;
@@ -57,6 +62,16 @@ type State = {
   updateMessage: (threadId: string, messageId: string, patch: Partial<ChatMessage>) => void;
   removeMessage: (threadId: string, messageId: string) => void;
   titleIfBlank: (threadId: string, title: string) => void;
+  renameThread: (threadId: string, title: string) => void;
+  setThreadFolder: (threadId: string, folderId: string | null) => void;
+  addFolder: (name: string) => void;
+  renameFolder: (id: string, name: string) => void;
+  removeFolder: (id: string) => void;
+  truncateFrom: (threadId: string, messageId: string) => void;
+  upsertMcp: (server: McpServer) => void;
+  removeMcp: (id: string) => void;
+  setToolGrant: (serverId: string, tool: string, allowed: boolean) => void;
+  clearSecrets: () => void;
 };
 
 export const useKiln = create<State>()(
@@ -69,6 +84,9 @@ export const useKiln = create<State>()(
       activeThreadId: WELCOME_ID,
       settings: DEFAULT_SETTINGS,
       mode: "chat",
+      folders: [],
+      mcpServers: [],
+      toolGrants: {},
       setMode: (mode) =>
         set((state) => {
           if (state.mode === mode && state.threads.some((thread) => thread.id === state.activeThreadId && threadMode(thread, "build") === mode)) {
@@ -160,6 +178,56 @@ export const useKiln = create<State>()(
             thread.id === threadId && (thread.title === "New chat" || thread.title === "New build") ? { ...thread, title } : thread,
           ),
         })),
+      renameThread: (threadId, title) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId ? { ...thread, title: title.trim().slice(0, 80) || thread.title } : thread,
+          ),
+        })),
+      setThreadFolder: (threadId, folderId) =>
+        set((state) => ({
+          threads: state.threads.map((thread) => (thread.id === threadId ? { ...thread, folderId: folderId ?? undefined } : thread)),
+        })),
+      addFolder: (name) =>
+        set((state) => ({
+          folders: [...state.folders, { id: newId(), name: name.trim().slice(0, 40) || "Folder" }].slice(0, 20),
+        })),
+      renameFolder: (id, name) =>
+        set((state) => ({
+          folders: state.folders.map((folder) => (folder.id === id ? { ...folder, name: name.trim().slice(0, 40) || folder.name } : folder)),
+        })),
+      removeFolder: (id) =>
+        set((state) => ({
+          folders: state.folders.filter((folder) => folder.id !== id),
+          threads: state.threads.map((thread) => (thread.folderId === id ? { ...thread, folderId: undefined } : thread)),
+        })),
+      truncateFrom: (threadId, messageId) =>
+        set((state) => ({
+          threads: state.threads.map((thread) => {
+            if (thread.id !== threadId) return thread;
+            const index = thread.messages.findIndex((message) => message.id === messageId);
+            if (index < 0) return thread;
+            return { ...thread, messages: thread.messages.slice(0, index), updatedAt: Date.now() };
+          }),
+        })),
+      upsertMcp: (server) =>
+        set((state) => ({
+          mcpServers: state.mcpServers.some((item) => item.id === server.id)
+            ? state.mcpServers.map((item) => (item.id === server.id ? server : item))
+            : [...state.mcpServers, server].slice(0, 12),
+        })),
+      removeMcp: (id) =>
+        set((state) => ({
+          mcpServers: state.mcpServers.filter((item) => item.id !== id),
+          toolGrants: Object.fromEntries(Object.entries(state.toolGrants).filter(([key]) => !key.startsWith(`${id}:`))),
+        })),
+      setToolGrant: (serverId, tool, allowed) =>
+        set((state) => ({ toolGrants: { ...state.toolGrants, [`${serverId}:${tool}`]: allowed } })),
+      clearSecrets: () =>
+        set((state) => ({
+          endpoints: state.endpoints.map((endpoint) => ({ ...endpoint, apiKey: "" })),
+          mcpServers: state.mcpServers.map((server) => ({ ...server, token: "" })),
+        })),
     }),
     {
       name: "kiln-v1",
@@ -172,6 +240,9 @@ export const useKiln = create<State>()(
         activeThreadId: state.activeThreadId,
         settings: state.settings,
         mode: state.mode,
+        folders: state.folders,
+        mcpServers: state.mcpServers,
+        toolGrants: state.toolGrants,
       }),
     },
   ),
