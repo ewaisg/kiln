@@ -1,0 +1,15 @@
+node_modules
+.vercel
+.tanstack
+dist
+.output
+screenshots
+artifacts
+attachments
+.project_id
+.node_modules.lock
+*.log
+.grok/*
+!.grok/app-env.json
+public/wllama/*.wasm
+AGENTS.md
