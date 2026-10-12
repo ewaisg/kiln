@@ -13,3 +13,5 @@ attachments
 !.grok/app-env.json
 public/wllama/*.wasm
 AGENTS.md
+
+.vercel
