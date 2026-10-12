@@ -34,16 +34,20 @@ export type ChatMessage = {
   error?: boolean;
 };
 
+export type WorkMode = "chat" | "build";
+
 export type Thread = {
   id: string;
   title: string;
   messages: ChatMessage[];
   updatedAt: number;
   via?: string;
+  mode?: WorkMode;
 };
 
 export type Settings = {
   systemPrompt: string;
+  chatPrompt?: string;
   temperature: number;
   maxTokens: number;
   localCtx: number;
@@ -59,7 +63,11 @@ export type Preset = {
   hint: string;
 };
 
-export const DEFAULT_SYSTEM = `You are Kiln, a coding assistant. You help people build software: programs, scripts, refactors, schemas, and small apps.
+export const CHAT_SYSTEM = `You are Kiln, a coding companion in chat. Talk with the person: explain, compare, debug, and think through design. Answer in plain language first.
+
+Use short fenced code blocks only when a snippet makes the point clearer. Do not wrap a whole app in one HTML document unless they ask for a file they can run. Do not generate images or video.`;
+
+export const DEFAULT_SYSTEM = `You are Kiln, a coding assistant in build mode. You help people build software: programs, scripts, refactors, schemas, and small apps.
 
 When asked to build a small web app, widget, or visual tool, reply with a few sentences and exactly one complete HTML document in a single html code fence. The document must be self-contained, with inline CSS and JavaScript only, no build step, and it must work on a narrow phone screen.
 
@@ -67,6 +75,7 @@ For other tasks, use fenced code blocks with a language tag and prefer complete,
 
 export const DEFAULT_SETTINGS: Settings = {
   systemPrompt: DEFAULT_SYSTEM,
+  chatPrompt: CHAT_SYSTEM,
   temperature: 0.4,
   maxTokens: 1600,
   localCtx: 2048,

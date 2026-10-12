@@ -13,9 +13,10 @@ import {
 } from "@/lib/library";
 import { completeLocal, ensureLocal, isLoadCancelled, unloadLocal } from "@/lib/local-engine";
 import { copyText } from "@/lib/preview-doc";
-import { useKiln } from "@/lib/store";
+import { useKiln, threadMode } from "@/lib/store";
 import {
   CATALOG,
+  CHAT_SYSTEM,
   DEFAULT_SYSTEM,
   PRESETS,
   newId,
@@ -24,8 +25,10 @@ import {
   type ProviderKind,
   type SavedModel,
   type Thread,
+  type WorkMode,
 } from "@/lib/types";
 import { endpointLabel, fitMessages, shouldDirect } from "@/lib/wire";
+import { downloadWindowsInstaller, isWindowsDevice } from "@/lib/windows-install";
 
 type Panel = "threads" | "library" | null;
 type Tab = "endpoints" | "models" | "studio";
@@ -40,11 +43,18 @@ type InstallPrompt = Event & {
   userChoice: Promise<{ outcome: string }>;
 };
 
-const STARTERS = [
+const BUILD_STARTERS = [
   "Build a phone-friendly tip calculator as one HTML file.",
   "Write a Python script that prints a directory tree.",
   "Design a SQLite schema for a reading list, plus the queries to use it.",
   "Turn a JSON list of expenses into a sortable HTML table.",
+];
+
+const CHAT_STARTERS = [
+  "Walk me through why a service worker is required before Windows will install a site.",
+  "Compare SQLite and Postgres for a small personal app.",
+  "I'll paste an error next. What should I include so you can help?",
+  "Help me decide what belongs in Chat versus Build.",
 ];
 
 function explain(error: unknown): string {
@@ -88,6 +98,8 @@ export function KilnApp() {
   const [preview, setPreview] = useState<{ title: string; html: string } | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [install, setInstall] = useState<InstallPrompt | null>(null);
+  const [windows, setWindows] = useState(false);
+  const [standalone, setStandalone] = useState(false);
   const [editing, setEditing] = useState<Endpoint | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -98,14 +110,30 @@ export function KilnApp() {
   const chip = endpointLabel(endpoint, localName, kiln.activeId);
 
   useEffect(() => {
-    void useKiln.persist.rehydrate();
+    void Promise.resolve(useKiln.persist.rehydrate()).then(() => {
+      const state = useKiln.getState();
+      const active = state.threads.find((item) => item.id === state.activeThreadId) ?? state.threads[0];
+      const next = active?.mode ?? "build";
+      if (next !== state.mode) useKiln.setState({ mode: next });
+    });
     void refreshModels();
     const onPrompt = (event: Event) => {
       event.preventDefault();
       setInstall(event as InstallPrompt);
     };
     window.addEventListener("beforeinstallprompt", onPrompt);
-    return () => window.removeEventListener("beforeinstallprompt", onPrompt);
+    setWindows(isWindowsDevice());
+    const display = window.matchMedia("(display-mode: standalone)");
+    const syncDisplay = () => setStandalone(display.matches);
+    syncDisplay();
+    display.addEventListener("change", syncDisplay);
+    if (import.meta.env.PROD && "serviceWorker" in navigator) {
+      void navigator.serviceWorker.register("/sw.js");
+    }
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      display.removeEventListener("change", syncDisplay);
+    };
   }, []);
 
   useEffect(() => {
@@ -186,11 +214,13 @@ export function KilnApp() {
       ?.messages.filter((message) => message.id !== assistantId && message.content.trim() && !message.error)
       .map((message) => ({ role: message.role, content: message.content })) ?? [];
     const settings = useKiln.getState().settings;
-    const maxChars = state.activeId === "local" ? Math.max(1800, settings.localCtx * 3) : 100_000;
-    const messages = fitMessages(
-      [...(settings.systemPrompt.trim() ? [{ role: "system" as const, content: settings.systemPrompt }] : []), ...history],
-      maxChars,
+    const mode = threadMode(
+      useKiln.getState().threads.find((item) => item.id === threadId),
+      state.mode,
     );
+    const system = mode === "chat" ? settings.chatPrompt?.trim() || CHAT_SYSTEM : settings.systemPrompt.trim() || DEFAULT_SYSTEM;
+    const maxChars = state.activeId === "local" ? Math.max(1800, settings.localCtx * 3) : 100_000;
+    const messages = fitMessages([{ role: "system" as const, content: system }, ...history], maxChars);
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -265,12 +295,16 @@ export function KilnApp() {
           ? `${load.name} is ready on this device`
           : "";
 
+  const mode = threadMode(thread, kiln.mode);
+  const visibleThreads = kiln.threads.filter((item) => threadMode(item, "build") === mode);
+
   return (
     <div className="flex h-dvh overflow-hidden bg-canvas text-ink">
       <aside className="hidden w-72 shrink-0 flex-col border-r border-line lg:flex">
         <ThreadPane
-          threads={kiln.threads}
+          threads={visibleThreads}
           activeId={kiln.activeThreadId}
+          mode={mode}
           onNew={() => {
             kiln.newThread();
             setPanel(null);
@@ -282,6 +316,8 @@ export function KilnApp() {
           onDelete={kiln.removeThread}
           install={install}
           onInstall={() => void install?.prompt()}
+          windows={windows}
+          standalone={standalone}
         />
       </aside>
 
@@ -290,10 +326,31 @@ export function KilnApp() {
           <button type="button" className="press h-11 rounded-md px-3 text-sm lg:hidden" onClick={() => setPanel("threads")}>
             Chats
           </button>
-          <div className="text-lg font-medium tracking-tight lg:hidden">Kiln</div>
+          <div className="flex h-11 items-center rounded-md bg-subtle p-1" role="group" aria-label="Mode">
+            {(
+              [
+                ["chat", "Chat"],
+                ["build", "Build"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={mode === id}
+                className={`press h-9 rounded-md px-3 text-sm font-medium ${mode === id ? "bg-accent text-accent-ink" : "text-muted"}`}
+                onClick={() => {
+                  if (mode === id) return;
+                  abortRef.current?.abort();
+                  kiln.setMode(id);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <button
             type="button"
-            className="press ml-auto h-11 max-w-56 truncate rounded-md bg-subtle px-3 text-sm sm:max-w-xs"
+            className="press ml-auto h-11 min-w-0 max-w-32 shrink truncate rounded-md bg-subtle px-3 text-sm sm:max-w-xs"
             onClick={() => {
               setTab(kiln.activeId === "local" ? "models" : "endpoints");
               setPanel("library");
@@ -323,6 +380,7 @@ export function KilnApp() {
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6">
             {thread && thread.messages.length === 0 ? (
               <Empty
+                mode={mode}
                 onPick={(prompt) => {
                   setDraft(prompt);
                   void sendText(prompt);
@@ -383,7 +441,7 @@ export function KilnApp() {
                 ref={boxRef}
                 value={draft}
                 rows={1}
-                placeholder="Describe what to build"
+                placeholder={mode === "build" ? "Describe what to build" : "Message Kiln"}
                 className="max-h-40 w-full resize-none rounded-lg border border-line bg-elevated px-3 py-3 text-base outline-none"
                 onChange={(event) => setDraft(event.target.value)}
                 onInput={(event) => {
@@ -447,8 +505,9 @@ export function KilnApp() {
       {panel === "threads" ? (
         <Overlay title="Chats" onClose={() => setPanel(null)}>
           <ThreadPane
-            threads={kiln.threads}
+            threads={visibleThreads}
             activeId={kiln.activeThreadId}
+            mode={mode}
             onNew={() => {
               kiln.newThread();
               setPanel(null);
@@ -461,6 +520,8 @@ export function KilnApp() {
             onDelete={kiln.removeThread}
             install={install}
             onInstall={() => void install?.prompt()}
+            windows={windows}
+            standalone={standalone}
           />
         </Overlay>
       ) : null}
@@ -523,6 +584,8 @@ export function KilnApp() {
             <StudioTab
               install={install}
               onInstall={() => void install?.prompt()}
+              windows={windows}
+              standalone={standalone}
             />
           ) : null}
         </Overlay>
@@ -560,16 +623,19 @@ function Overlay({ title, onClose, children }: { title: string; onClose: () => v
   );
 }
 
-function Empty({ onPick }: { onPick: (prompt: string) => void }) {
+function Empty({ mode, onPick }: { mode: WorkMode; onPick: (prompt: string) => void }) {
+  const build = mode === "build";
+  const starters = build ? BUILD_STARTERS : CHAT_STARTERS;
   return (
     <div className="py-8">
-      <h1 className="text-xl font-medium tracking-tight">What should we build?</h1>
+      <h1 className="text-xl font-medium tracking-tight">{build ? "What should we build?" : "What do you want to talk through?"}</h1>
       <p className="mt-3 max-w-prose text-muted">
-        A coding chat for a phone, a tablet, or a computer. Run a GGUF model on this device — the same files LM
-        Studio uses — or connect Grok, OpenAI, Claude, Azure, LM Studio, Ollama, or any compatible endpoint.
+        {build
+          ? "Build writes files, scripts, and small apps. An HTML reply can be previewed on this page. Switch to Chat when you want a conversation instead of a deliverable."
+          : "Chat explains, compares, and debugs without turning every answer into a project. Switch to Build when you want a file you can run."}
       </p>
       <div className="mt-6 grid gap-2 sm:grid-cols-2">
-        {STARTERS.map((prompt) => (
+        {starters.map((prompt) => (
           <button
             key={prompt}
             type="button"
@@ -587,19 +653,25 @@ function Empty({ onPick }: { onPick: (prompt: string) => void }) {
 function ThreadPane({
   threads,
   activeId,
+  mode,
   onNew,
   onSelect,
   onDelete,
   install,
   onInstall,
+  windows,
+  standalone,
 }: {
   threads: Thread[];
   activeId: string;
+  mode: WorkMode;
   onNew: () => void;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   install: InstallPrompt | null;
   onInstall: () => void;
+  windows?: boolean;
+  standalone?: boolean;
 }) {
   const [armed, setArmed] = useState<string | null>(null);
   return (
@@ -607,7 +679,7 @@ function ThreadPane({
       <div className="flex items-center gap-2 px-3 py-3">
         <span className="text-lg font-medium tracking-tight lg:inline">Kiln</span>
         <button type="button" className="press ml-auto h-11 rounded-md bg-accent px-3 text-sm font-medium text-accent-ink" onClick={onNew}>
-          New chat
+          {mode === "build" ? "New build" : "New chat"}
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2">
@@ -634,13 +706,7 @@ function ThreadPane({
         ))}
       </div>
       <div className="border-t border-line px-3 py-3">
-        {install ? (
-          <button type="button" className="press h-11 w-full rounded-md bg-subtle text-sm font-medium" onClick={onInstall}>
-            Install app
-          </button>
-        ) : (
-          <p className="text-xs text-faint">Install from the browser menu to open Kiln full screen.</p>
-        )}
+        <InstallActions install={install} onInstall={onInstall} windows={windows} standalone={standalone} compact />
       </div>
     </div>
   );
@@ -1046,24 +1112,45 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function StudioTab({ install, onInstall }: { install: InstallPrompt | null; onInstall: () => void }) {
+function StudioTab({
+  install,
+  onInstall,
+  windows,
+  standalone,
+}: {
+  install: InstallPrompt | null;
+  onInstall: () => void;
+  windows?: boolean;
+  standalone?: boolean;
+}) {
   const settings = useKiln((state) => state.settings);
   const update = useKiln((state) => state.updateSettings);
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm text-muted">
-        Kiln is aimed at building software. When a reply contains an HTML or JavaScript block, Preview runs it in a
-        sandbox on this page.
+        Chat is a conversation. Build writes software, and an HTML or JavaScript block can be previewed in a sandbox
+        on this page.
       </p>
-      <Field label="System prompt">
+      <Field label="Chat prompt">
+        <textarea
+          value={settings.chatPrompt ?? CHAT_SYSTEM}
+          onChange={(event) => update({ chatPrompt: event.target.value })}
+          className="min-h-32 w-full rounded-md border border-line bg-canvas px-3 py-3 text-base"
+        />
+      </Field>
+      <Field label="Build prompt">
         <textarea
           value={settings.systemPrompt}
           onChange={(event) => update({ systemPrompt: event.target.value })}
-          className="min-h-40 w-full rounded-md border border-line bg-canvas px-3 py-3 text-base"
+          className="min-h-32 w-full rounded-md border border-line bg-canvas px-3 py-3 text-base"
         />
       </Field>
-      <button type="button" className="press h-11 self-start rounded-md px-3 text-sm text-muted" onClick={() => update({ systemPrompt: DEFAULT_SYSTEM })}>
-        Reset prompt
+      <button
+        type="button"
+        className="press h-11 self-start rounded-md px-3 text-sm text-muted"
+        onClick={() => update({ systemPrompt: DEFAULT_SYSTEM, chatPrompt: CHAT_SYSTEM })}
+      >
+        Reset prompts
       </button>
       <Field label={`Temperature ${settings.temperature.toFixed(1)}`}>
         <input
@@ -1098,14 +1185,42 @@ function StudioTab({ install, onInstall }: { install: InstallPrompt | null; onIn
           <option value={4096}>4096 — more memory</option>
         </select>
       </Field>
+      <InstallActions install={install} onInstall={onInstall} windows={windows} standalone={standalone} />
+    </div>
+  );
+}
+
+function InstallActions({
+  install,
+  onInstall,
+  windows,
+  standalone,
+  compact,
+}: {
+  install: InstallPrompt | null;
+  onInstall: () => void;
+  windows?: boolean;
+  standalone?: boolean;
+  compact?: boolean;
+}) {
+  if (standalone) {
+    return <p className="text-xs text-faint">Kiln is running as an installed app.</p>;
+  }
+  return (
+    <div className="flex flex-col gap-2">
       {install ? (
         <button type="button" className="press h-11 rounded-md bg-accent text-sm font-medium text-accent-ink" onClick={onInstall}>
           Install Kiln
         </button>
-      ) : (
+      ) : null}
+      <button type="button" className="press h-11 rounded-md bg-subtle text-sm font-medium" onClick={downloadWindowsInstaller}>
+        {windows ? "Install on Windows" : "Download Windows installer"}
+      </button>
+      {compact ? null : (
         <p className="text-sm text-muted">
-          To install, use the browser menu and choose Add to Home Screen or Install app. It then opens full screen,
-          like any other app, and you can remove it the same way.
+          On Windows, the download is Install-Kiln.bat. Double-click it. Edge or Chrome opens Kiln in its own window,
+          and a Kiln shortcut is added to the Start menu and the desktop. If the browser offers Install Kiln, that
+          is the same app without the extra file.
         </p>
       )}
     </div>
