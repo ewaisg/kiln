@@ -81,6 +81,11 @@ async function runLoad(
   const params = {
     n_ctx: nCtx,
     n_threads: 1,
+    // WebGPU is on by default and corrupts sampling on phones: the model
+    // loops on the same tokens ("vid vid", "clear clear") for every GGUF.
+    n_gpu_layers: 0,
+    flash_attn: false,
+    n_batch: Math.min(128, nCtx),
     progressCallback: ({ loaded, total }: { loaded: number; total: number }) => {
       if (mine !== ticket) return;
       onProgress("Downloading", total > 0 ? loaded / total : null);
@@ -94,7 +99,7 @@ async function runLoad(
   } else {
     const blob = await fileForModel(model);
     onProgress("Loading into memory", null);
-    await current.loadModel([blob], { n_ctx: nCtx, n_threads: 1 });
+    await current.loadModel([blob], params);
   }
   if (mine !== ticket) throw new LoadCancelled();
   loadedKey = key;
@@ -114,6 +119,11 @@ export async function completeLocal(
     stream: true,
     temperature,
     max_tokens: maxTokens,
+    top_k: 40,
+    top_p: 0.9,
+    min_p: 0.05,
+    penalty_repeat: 1.15,
+    penalty_last_n: 128,
     abortSignal: signal,
   });
   let full = "";
@@ -121,8 +131,18 @@ export async function completeLocal(
     const text = chunk.choices?.[0]?.delta?.content;
     if (typeof text === "string" && text) {
       full += text;
+      if (isDegenerate(full)) {
+        full = "That reply collapsed into a repeated loop, so it was stopped. Reload this page, open the model again, and resend.";
+        onDelta(full);
+        break;
+      }
       onDelta(full);
     }
   }
   return full;
+}
+
+function isDegenerate(text: string): boolean {
+  const tail = text.slice(-180);
+  return tail.length >= 36 && /(.{2,16}?)\1{5,}$/.test(tail);
 }
