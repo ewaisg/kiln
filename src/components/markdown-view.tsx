@@ -1,130 +1,11 @@
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import { copyText, downloadText, toPreviewDocument } from "@/lib/preview-doc";
 import { highlightCode } from "@/lib/highlight";
-
-type Piece = { type: "text"; text: string } | { type: "code"; lang: string; code: string };
-
-function splitFences(source: string): Piece[] {
-  const parts = source.split("```");
-  const pieces: Piece[] = [];
-  parts.forEach((part, index) => {
-    if (index % 2 === 0) {
-      if (part) pieces.push({ type: "text", text: part });
-      return;
-    }
-    const breakAt = part.indexOf("\n");
-    if (breakAt === -1) {
-      const token = part.trim();
-      const lang = /^[\w#+.-]+$/.test(token) ? token : "";
-      pieces.push({ type: "code", lang, code: lang ? "" : part });
-      return;
-    }
-    const lang = part.slice(0, breakAt).trim();
-    pieces.push({ type: "code", lang, code: part.slice(breakAt + 1).replace(/\n$/, "") });
-  });
-  return pieces;
-}
-
-function Inline({ text }: { text: string }) {
-  const nodes: ReactNode[] = [];
-  const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  let key = 0;
-  while ((match = pattern.exec(text))) {
-    if (match.index > last) nodes.push(text.slice(last, match.index));
-    const token = match[0];
-    if (token.startsWith("`")) {
-      nodes.push(
-        <code key={key} className="rounded-sm bg-subtle px-1 font-mono text-sm">
-          {token.slice(1, -1)}
-        </code>,
-      );
-    } else if (token.startsWith("**")) {
-      nodes.push(
-        <strong key={key} className="font-medium">
-          {token.slice(2, -2)}
-        </strong>,
-      );
-    } else {
-      const label = token.slice(1, token.indexOf("]"));
-      const href = token.slice(token.indexOf("(") + 1, -1);
-      nodes.push(
-        <a key={key} href={href} target="_blank" rel="noreferrer" className="underline decoration-line underline-offset-2">
-          {label}
-        </a>,
-      );
-    }
-    last = match.index + token.length;
-    key += 1;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return <>{nodes}</>;
-}
-
-function Prose({ text }: { text: string }) {
-  const lines = text.replace(/\n+$/, "").split("\n");
-  const blocks: ReactNode[] = [];
-  let paragraph: string[] = [];
-  let list: string[] = [];
-  let key = 0;
-
-  const flushParagraph = () => {
-    if (paragraph.length === 0) return;
-    blocks.push(
-      <p key={key} className="my-2">
-        <Inline text={paragraph.join("\n")} />
-      </p>,
-    );
-    key += 1;
-    paragraph = [];
-  };
-  const flushList = () => {
-    if (list.length === 0) return;
-    blocks.push(
-      <ul key={key} className="my-2 list-disc space-y-1 pl-5">
-        {list.map((item, index) => (
-          <li key={index}>
-            <Inline text={item} />
-          </li>
-        ))}
-      </ul>,
-    );
-    key += 1;
-    list = [];
-  };
-
-  for (const line of lines) {
-    const heading = /^(#{1,3})\s+(.*)$/.exec(line);
-    const item = /^[-*]\s+(.*)$/.exec(line) || /^\d+\.\s+(.*)$/.exec(line);
-    if (!line.trim()) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-    if (heading) {
-      flushParagraph();
-      flushList();
-      blocks.push(
-        <h2 key={key} className="mb-1 mt-4 text-lg font-medium tracking-tight">
-          <Inline text={heading[2] ?? ""} />
-        </h2>,
-      );
-      key += 1;
-      continue;
-    }
-    if (item) {
-      flushParagraph();
-      list.push(item[1] ?? "");
-      continue;
-    }
-    flushList();
-    paragraph.push(line);
-  }
-  flushParagraph();
-  flushList();
-  return <>{blocks}</>;
-}
 
 const EXT: Record<string, string> = {
   html: "html",
@@ -176,7 +57,9 @@ function Fence({
           <button
             type="button"
             className="press h-11 rounded-md bg-subtle px-3 text-sm font-medium"
-            onClick={() => downloadText(`${label || "snippet"}.${EXT[lang.toLowerCase()] || "txt"}`, code)}
+            onClick={() =>
+              downloadText(`${label || "snippet"}.${EXT[lang.toLowerCase()] || "txt"}`, code)
+            }
           >
             Save
           </button>
@@ -208,16 +91,46 @@ export function Markdown({
   text: string;
   onPreview: (html: string, title: string) => void;
 }) {
-  const pieces = splitFences(text);
   return (
-    <div className="min-w-0">
-      {pieces.map((piece, index) =>
-        piece.type === "code" ? (
-          <Fence key={index} lang={piece.lang} code={piece.code} onPreview={onPreview} />
-        ) : (
-          <Prose key={index} text={piece.text} />
-        ),
-      )}
+    <div className="prose min-w-0">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+        components={{
+          pre: ({ children }) => <>{children}</>,
+          code: ({ className, children, node }) => {
+            const lang = /language-([\w#+.-]+)/.exec(className ?? "")?.[1] ?? "";
+            const code = String(children).replace(/\n$/, "");
+            const block =
+              Boolean(className) || node?.position?.start.line !== node?.position?.end.line;
+            return block ? (
+              <Fence lang={lang} code={code} onPreview={onPreview} />
+            ) : (
+              <code className="rounded-sm bg-subtle px-1 font-mono text-sm">{children}</code>
+            );
+          },
+          table: ({ children }) => (
+            <div className="table-scroll">
+              <table>{children}</table>
+            </div>
+          ),
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noopener noreferrer">
+              {children}
+            </a>
+          ),
+          img: ({ src, alt }) =>
+            src?.startsWith("https://") ? (
+              <a href={src} target="_blank" rel="noopener noreferrer">
+                {alt || "Open external image"}
+              </a>
+            ) : (
+              <span>{alt}</span>
+            ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
     </div>
   );
 }

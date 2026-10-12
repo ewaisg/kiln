@@ -9,7 +9,7 @@
  *
  *   node scripts/preview.mjs stop|restart
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -176,6 +176,10 @@ function pgidOf(pid) {
 }
 
 function killPid(pid, signal) {
+  if (process.platform === "win32") {
+    try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }); } catch { /* already exited */ }
+    return;
+  }
   // restart() detaches the server into its own process group, so signal the
   // group to reach `vite` under the `npm` wrapper. Only for a leader: `-pid` on
   // a pid that leads no group still reaches any unrelated group numbered pid.
@@ -196,6 +200,7 @@ function killPid(pid, signal) {
 
 function cmdlineOf(pid) {
   try {
+    if (process.platform === "win32") return execFileSync("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`], { windowsHide: true, encoding: "utf8" });
     return readFileSync(`/proc/${pid}/cmdline`, "utf8");
   } catch {
     // Usually a dead pid — the stale pidfile this corroboration exists for.
@@ -243,6 +248,14 @@ function pidsForSocketInodes(inodes) {
  * whose owning pid could not be resolved (an fd dir we may not read).
  */
 function portOwners() {
+  if (process.platform === "win32") {
+    try {
+      const output = execFileSync("powershell.exe", ["-NoProfile", "-Command", `Get-NetTCPConnection -LocalPort ${PREVIEW_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess`], { windowsHide: true, encoding: "utf8" });
+      const listeners = [...new Set(output.split(/\s+/).map(parsePid).filter(pid => pid !== null))];
+      const pids = listeners.filter(pid => /(?:vite(?:\.js)?["']?\s+["']?preview|run\s+preview(?:\s|$))/i.test(cmdlineOf(pid)));
+      return { pids, unattributed: listeners.length > pids.length };
+    } catch { return { pids: [], unattributed: false }; }
+  }
   const inodes = new Set();
   for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
     let dump;
@@ -297,9 +310,10 @@ async function restart() {
 
   mkdirSync(dirname(LOG_FILE), { recursive: true });
   const log = openSync(LOG_FILE, "a");
-  const child = spawn("npm", ["run", "preview"], {
+  const child = spawn(process.platform === "win32" ? "cmd.exe" : "npm", process.platform === "win32" ? ["/d", "/s", "/c", "npm run preview"] : ["run", "preview"], {
     cwd: ROOT,
     detached: true,
+    windowsHide: true,
     stdio: ["ignore", log, log],
   });
   child.unref();
@@ -335,7 +349,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.error(`[preview] ${args.error}`);
     process.exit(1);
   }
-  if (!existsSync("/proc/self")) {
+  if (process.platform !== "win32" && !existsSync("/proc/self")) {
     console.error("[preview] no /proc — this script only runs inside the sandbox");
     process.exit(1);
   }

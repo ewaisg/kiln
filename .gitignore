@@ -1,5 +1,9 @@
 node_modules
 .vercel
+desktop/companion.config.json
+.env
+.env.*
+!.env.example
 .tanstack
 dist
 .output

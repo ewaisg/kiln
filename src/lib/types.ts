@@ -10,6 +10,8 @@ export const PROVIDER_KINDS = [
 ] as const;
 
 export type ProviderKind = (typeof PROVIDER_KINDS)[number];
+export type Capability = "chat" | "vision" | "image" | "transcription" | "speech" | "video";
+export type PerformanceProfile = "auto" | "balanced" | "quality" | "saver";
 
 export type Endpoint = {
   id: string;
@@ -20,6 +22,8 @@ export type Endpoint = {
   model: string;
   apiVersion: string;
   direct: boolean;
+  capabilities?: Capability[];
+  chatProfile?: "auto" | "standard" | "reasoning";
 };
 
 export type WireMessage = {
@@ -33,6 +37,9 @@ export type Attachment = {
   name: string;
   kind: "text" | "image" | "audio" | "video" | "file";
   detail: string;
+  mediaId?: string;
+  mime?: string;
+  bytes?: number;
 };
 
 export type ChatMessage = {
@@ -42,6 +49,9 @@ export type ChatMessage = {
   error?: boolean;
   attachments?: Attachment[];
   media?: { id: string; alt: string }[];
+  images?: { mime: string; data: string }[];
+  status?: "complete" | "stopped" | "error";
+  visionObservation?: string;
 };
 
 export type WorkMode = "chat" | "build";
@@ -54,6 +64,8 @@ export type Thread = {
   via?: string;
   mode?: WorkMode;
   folderId?: string;
+  archived?: boolean;
+  parentThreadId?: string;
 };
 
 export type Folder = {
@@ -66,6 +78,8 @@ export type McpServer = {
   name: string;
   url: string;
   token: string;
+  transport?: "http" | "companion";
+  oauthClientId?: string;
 };
 
 export type Settings = {
@@ -75,6 +89,12 @@ export type Settings = {
   maxTokens: number;
   localCtx: number;
   theme: "dark" | "light";
+  performanceProfile?: PerformanceProfile;
+  mediaDefaults?: Partial<Record<Capability, { endpointId: string; model: string }>>;
+  rememberCredentials?: boolean;
+  reducedMotion?: boolean;
+  fontSize?: "normal" | "large";
+  promptTemplates?: { id: string; name: string; text: string }[];
 };
 
 export type Preset = {
@@ -104,6 +124,8 @@ export const DEFAULT_SETTINGS: Settings = {
   maxTokens: 1600,
   localCtx: 2048,
   theme: "dark",
+  performanceProfile: "auto",
+  rememberCredentials: false,
 };
 
 export const PRESETS: Preset[] = [
@@ -220,7 +242,19 @@ export const CATALOG = [
   },
 ] as const;
 
-export type CatalogItem = (typeof CATALOG)[number];
+export type CatalogItem = {
+  id: string;
+  name: string;
+  blurb: string;
+  size: string;
+  repo: string;
+  file: string;
+  bytes: number;
+  quantization?: string;
+  memory?: string;
+  format?: string;
+  compatible?: boolean;
+};
 
 export type SavedModel = {
   id: string;
@@ -233,6 +267,7 @@ export type SavedModel = {
   opfsName: string;
   externalName?: string;
   where?: string;
+  folderKey?: string;
   createdAt: number;
 };
 

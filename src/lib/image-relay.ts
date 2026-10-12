@@ -1,4 +1,5 @@
 import { assertRelayable } from "@/lib/wire";
+import { safeFetch } from "@/lib/relay-security.server";
 
 const OPENAI_MODEL = "gpt-image-1";
 const GROK_MODEL = "grok-imagine-image-2.0";
@@ -12,7 +13,7 @@ export async function relayImage(raw: string, signal: AbortSignal): Promise<Resp
     throw new Error("Invalid request.");
   }
   if (!json || typeof json !== "object") throw new Error("Invalid request.");
-  const body = json as { kind?: unknown; baseUrl?: unknown; apiKey?: unknown; prompt?: unknown };
+  const body = json as { kind?: unknown; baseUrl?: unknown; apiKey?: unknown; prompt?: unknown; model?: unknown };
   if (body.kind !== "openai" && body.kind !== "grok") {
     throw new Error("Picture generation is available on a saved OpenAI or Grok endpoint.");
   }
@@ -22,17 +23,13 @@ export async function relayImage(raw: string, signal: AbortSignal): Promise<Resp
   }
   const root = body.baseUrl.replace(/\/+$/, "").replace(/\/images\/generations$/i, "").replace(/\/v1$/i, "");
   const url = assertRelayable(`${root}/v1/images/generations`);
-  const model = body.kind === "grok" ? GROK_MODEL : OPENAI_MODEL;
+  const model = typeof body.model === "string" && body.model.trim() ? body.model.trim().slice(0, 200) : body.kind === "grok" ? GROK_MODEL : OPENAI_MODEL;
   const prompt = body.prompt.trim().slice(0, 2000);
-  const first = await postImage(url, body.apiKey.trim(), { model, prompt, n: 1, response_format: "b64_json" }, signal);
+  const first = await postImage(url, body.apiKey.trim(), { model, prompt, n: 1 }, signal);
   const image = first.ok ? await readImage(first.response, signal) : null;
   if (image) return Response.json(image);
-  if (!first.ok && first.status !== 400) throw new Error(first.message);
-  const second = await postImage(url, body.apiKey.trim(), { model, prompt, n: 1 }, signal);
-  if (!second.ok) throw new Error(second.message || (!first.ok ? first.message : "The provider did not return an image."));
-  const fallback = await readImage(second.response, signal);
-  if (!fallback) throw new Error("The provider did not return an image.");
-  return Response.json(fallback);
+  if (!first.ok) throw new Error(first.message);
+  throw new Error("The provider did not return an image.");
 }
 
 async function postImage(
@@ -41,7 +38,7 @@ async function postImage(
   payload: Record<string, unknown>,
   signal: AbortSignal,
 ): Promise<{ ok: true; response: Response } | { ok: false; status: number; message: string }> {
-  const response = await fetch(url, {
+  const response = await safeFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(payload),
@@ -63,7 +60,7 @@ async function readImage(response: Response, signal: AbortSignal): Promise<{ mim
   }
   if (typeof item.url === "string" && item.url) {
     const fileUrl = assertRelayable(item.url);
-    const file = await fetch(fileUrl, { signal });
+    const file = await safeFetch(fileUrl, { signal });
     if (!file.ok) throw new Error("The image link could not be fetched.");
     const buffer = await file.arrayBuffer();
     if (buffer.byteLength < 32 || buffer.byteLength > 8_000_000) throw new Error("The image came back in an unexpected size.");

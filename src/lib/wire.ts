@@ -1,4 +1,5 @@
 import { presetByKind, type Endpoint, type ProviderKind, type WireMessage } from "@/lib/types";
+import { sseData } from "@/lib/sse";
 
 const KINDS = new Set<string>([
   "grok",
@@ -80,7 +81,9 @@ export function shouldDirect(endpoint: Pick<Endpoint, "direct" | "baseUrl">): bo
 export function assertRelayable(input: string): URL {
   const url = parseHttpUrl(input);
   if (url.protocol !== "https:") {
-    throw new Error("The relay only forwards public https endpoints. Local addresses are called from this device.");
+    throw new Error(
+      "The relay only forwards public https endpoints. Local addresses are called from this device.",
+    );
   }
   if (isPrivateHost(url.hostname)) {
     throw new Error("That address is private. Kiln calls it from this device instead.");
@@ -143,14 +146,21 @@ function messageContent(message: WireMessage, anthropic: boolean): string | unkn
   ];
 }
 
-function coalesce(messages: WireMessage[]): { role: "user" | "assistant"; content: string | unknown[] }[] {
+function coalesce(
+  messages: WireMessage[],
+): { role: "user" | "assistant"; content: string | unknown[] }[] {
   const out: { role: "user" | "assistant"; content: string | unknown[] }[] = [];
   for (const message of messages) {
     if (message.role !== "user" && message.role !== "assistant") continue;
     const content = messageContent(message, true);
     if (typeof content === "string" && !content.trim()) continue;
     const prev = out[out.length - 1];
-    if (prev && prev.role === message.role && typeof prev.content === "string" && typeof content === "string") {
+    if (
+      prev &&
+      prev.role === message.role &&
+      typeof prev.content === "string" &&
+      typeof content === "string"
+    ) {
       prev.content += `\n\n${content}`;
     } else out.push({ role: message.role, content });
   }
@@ -176,6 +186,14 @@ export function buildChatRequest(
   const direct = shouldDirect(endpoint);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   const temp = kind === "anthropic" ? Math.min(1, temperature) : temperature;
+  const reasoning =
+    endpoint.chatProfile === "reasoning" ||
+    (endpoint.chatProfile !== "standard" &&
+      kind === "openai" &&
+      /^(?:o\d(?:-|$)|gpt-[5-9](?:[.-]|$))/i.test(model));
+  const parameters = reasoning
+    ? { max_completion_tokens: maxTokens }
+    : { temperature: temp, max_tokens: maxTokens };
 
   if (kind === "anthropic") {
     if (apiKey) headers["x-api-key"] = apiKey;
@@ -213,8 +231,7 @@ export function buildChatRequest(
       headers,
       body: {
         messages: chatMessages,
-        temperature: temp,
-        max_tokens: maxTokens,
+        ...parameters,
         stream: true,
       },
     };
@@ -231,14 +248,16 @@ export function buildChatRequest(
     body: {
       model,
       messages: chatMessages,
-      temperature: temp,
-      max_tokens: maxTokens,
+      ...parameters,
       stream: true,
     },
   };
 }
 
-export function buildModelsRequest(endpoint: Endpoint): { url: string; headers: Record<string, string> } {
+export function buildModelsRequest(endpoint: Endpoint): {
+  url: string;
+  headers: Record<string, string>;
+} {
   const apiKey = cleanLine(endpoint.apiKey);
   const headers: Record<string, string> = {};
   if (endpoint.kind === "anthropic") {
@@ -267,7 +286,10 @@ export function buildModelsRequest(endpoint: Endpoint): { url: string; headers: 
   }
   const url =
     endpoint.kind === "azure-ai"
-      ? withVersion(`${rootUrl(endpoint.baseUrl)}/models`, endpoint.apiVersion || "2024-05-01-preview")
+      ? withVersion(
+          `${rootUrl(endpoint.baseUrl)}/models`,
+          endpoint.apiVersion || "2024-05-01-preview",
+        )
       : `${rootUrl(endpoint.baseUrl)}/models`;
   return { url, headers };
 }
@@ -326,7 +348,8 @@ export function anthropicDelta(json: unknown): string {
     error?: { message?: string };
     message?: { content?: unknown };
   };
-  if (record.type === "error") throw new Error(record.error?.message || "The provider returned an error.");
+  if (record.type === "error")
+    throw new Error(record.error?.message || "The provider returned an error.");
   if (record.type === "content_block_delta" && record.delta?.text) return record.delta.text;
   return "";
 }
@@ -337,7 +360,12 @@ function textOf(value: unknown): string {
   return value
     .map((part) => {
       if (typeof part === "string") return part;
-      if (part && typeof part === "object" && "text" in part && typeof (part as { text: unknown }).text === "string") {
+      if (
+        part &&
+        typeof part === "object" &&
+        "text" in part &&
+        typeof (part as { text: unknown }).text === "string"
+      ) {
         return (part as { text: string }).text;
       }
       return "";
@@ -356,32 +384,21 @@ export function extractFull(json: unknown, kind: ProviderKind): string {
   return openAiDelta(json);
 }
 
-export async function* tokensFromUpstream(response: Response, kind: ProviderKind): AsyncGenerator<string> {
-  if (!response.body) return;
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+export async function* tokensFromUpstream(
+  response: Response,
+  kind: ProviderKind,
+): AsyncGenerator<string> {
   const pull = kind === "anthropic" ? anthropicDelta : openAiDelta;
-  while (true) {
-    const step = await reader.read();
-    if (step.done) break;
-    buffer += decoder.decode(step.value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-      const data = trimmed.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
-      let json: unknown;
-      try {
-        json = JSON.parse(data);
-      } catch {
-        continue;
-      }
-      const text = pull(json);
-      if (text) yield text;
+  for await (const data of sseData(response)) {
+    if (!data.trim()) continue;
+    let json: unknown;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      throw new Error("The provider returned malformed streaming data.");
     }
+    const text = pull(json);
+    if (text) yield text;
   }
 }
 
@@ -390,7 +407,8 @@ export async function errorText(response: Response): Promise<string> {
   try {
     const json = JSON.parse(text) as { error?: { message?: string } | string; message?: string };
     if (typeof json.error === "string" && json.error) return json.error.slice(0, 500);
-    if (json.error && typeof json.error === "object" && json.error.message) return json.error.message.slice(0, 500);
+    if (json.error && typeof json.error === "object" && json.error.message)
+      return json.error.message.slice(0, 500);
     if (json.message) return json.message.slice(0, 500);
   } catch {
     /* plain text */
@@ -399,7 +417,11 @@ export async function errorText(response: Response): Promise<string> {
   return clipped || `Request failed (${response.status}).`;
 }
 
-export function endpointLabel(endpoint: Endpoint | undefined, localName: string | null, activeId: string): string {
+export function endpointLabel(
+  endpoint: Endpoint | undefined,
+  localName: string | null,
+  activeId: string,
+): string {
   if (activeId === "local") return localName ? `Local · ${localName}` : "Local model";
   if (!endpoint) return "No model";
   const preset = presetByKind(endpoint.kind);

@@ -15,7 +15,7 @@ function log(v){let s;try{s=typeof v==="string"?v:JSON.stringify(v,null,2)}catch
 window.addEventListener("error",function(e){log(e.message)});
 try{${safe}
 }catch(e){log(e&&e.stack||String(e))}
-<\/script></body></html>`;
+</script></body></html>`;
   }
   return null;
 }

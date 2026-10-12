@@ -1,4 +1,6 @@
 import type { ProviderKind, WireMessage } from "@/lib/types";
+import { safeFetch } from "@/lib/relay-security.server";
+import { reportedCapabilities } from "@/lib/provider-capabilities";
 import {
   assertRelayable,
   buildChatRequest,
@@ -21,10 +23,11 @@ export type RelayChatBody = {
   temperature: number;
   maxTokens: number;
   messages: WireMessage[];
+  chatProfile?: "auto" | "standard" | "reasoning";
 };
 
 export function readChatBody(raw: string): RelayChatBody {
-  if (raw.length > 1_500_000) throw new Error("That conversation is too large to relay.");
+  if (raw.length > 16_000_000) throw new Error("That conversation exceeds 16 MB. Start a branch with fewer images.");
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -38,22 +41,23 @@ export function readChatBody(raw: string): RelayChatBody {
   const apiKey = typeof body.apiKey === "string" ? body.apiKey : "";
   const apiVersion = typeof body.apiVersion === "string" ? body.apiVersion : "";
   const temperature = clamp(body.temperature, 0, 2, 0.4);
-  const maxTokens = Math.round(clamp(body.maxTokens, 16, 8192, 1600));
+  const maxTokens = Math.round(clamp(body.maxTokens, 16, 32768, 1600));
   if (!Array.isArray(body.messages)) throw new Error("Missing messages.");
   const messages: WireMessage[] = [];
-  for (const item of body.messages.slice(-40)) {
+  if (body.messages.length > 128) throw new Error("The context exceeds 128 messages. Start a new conversation or shorten the context.");
+  for (const item of body.messages) {
     if (!item || typeof item !== "object") continue;
     const message = item as { role?: unknown; content?: unknown; images?: unknown };
     if (message.role !== "system" && message.role !== "user" && message.role !== "assistant") continue;
     if (typeof message.content !== "string") continue;
+    if (Array.isArray(message.images) && message.images.length > 24) throw new Error("A message supports up to 24 images or sampled frames.");
     const images = Array.isArray(message.images)
       ? message.images
-          .slice(0, 2)
           .map((image) => {
             if (!image || typeof image !== "object") return null;
             const row = image as { mime?: unknown; data?: unknown };
             if (row.mime !== "image/jpeg" && row.mime !== "image/png" && row.mime !== "image/webp") return null;
-            if (typeof row.data !== "string" || row.data.length > 350_000) return null;
+            if (typeof row.data !== "string" || row.data.length > 350_000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(row.data)) throw new Error("An image is invalid or exceeds the supported size. Reattach it to resize.");
             return { mime: row.mime, data: row.data };
           })
           .filter((image): image is { mime: string; data: string } => image !== null)
@@ -70,6 +74,7 @@ export function readChatBody(raw: string): RelayChatBody {
     temperature,
     maxTokens,
     messages,
+    chatProfile: body.chatProfile === "reasoning" || body.chatProfile === "standard" ? body.chatProfile : "auto",
   };
 }
 
@@ -101,6 +106,7 @@ export async function relayChat(payload: RelayChatBody, signal: AbortSignal): Pr
     model: payload.model,
     apiVersion: payload.apiVersion,
     direct: false,
+    chatProfile: payload.chatProfile,
   };
   if (shouldDirect(endpoint)) {
     return Response.json(
@@ -132,7 +138,7 @@ export async function relayModels(raw: string, signal: AbortSignal): Promise<Res
   assertRelayable(request.url);
   let upstream: Response;
   try {
-    upstream = await fetch(request.url, { headers: request.headers, signal, redirect: "manual" });
+    upstream = await safeFetch(request.url, { headers: request.headers, signal, redirect: "manual" });
   } catch {
     return Response.json({ error: "Could not reach that endpoint." }, { status: 502 });
   }
@@ -140,14 +146,17 @@ export async function relayModels(raw: string, signal: AbortSignal): Promise<Res
     return Response.json({ error: "The endpoint redirected. Refusing to follow it." }, { status: 502 });
   }
   if (!upstream.ok) return Response.json({ error: await errorText(upstream) }, { status: 502 });
-  const ids = parseModelIds(await upstream.json());
-  return Response.json({ ids });
+  const models: unknown = await upstream.json();
+  const ids = parseModelIds(models);
+  return Response.json({ ids, capabilities: reportedCapabilities(models) });
 }
 
 async function pipeUpstream(request: UpstreamRequest, kind: ProviderKind, signal: AbortSignal): Promise<Response> {
+  const cancellation = new AbortController();
+  signal = AbortSignal.any([signal, cancellation.signal]);
   let upstream: Response;
   try {
-    upstream = await fetch(request.url, {
+    upstream = await safeFetch(request.url, {
       method: "POST",
       headers: request.headers,
       body: JSON.stringify(request.body),
@@ -163,10 +172,11 @@ async function pipeUpstream(request: UpstreamRequest, kind: ProviderKind, signal
   if (!upstream.ok) return Response.json({ error: await errorText(upstream) }, { status: 502 });
   const type = upstream.headers.get("content-type") ?? "";
   const encoder = new TextEncoder();
+  let cancelled = false;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (value: unknown) => {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+        if (!cancelled) controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
       };
       try {
         if (type.includes("application/json")) {
@@ -179,9 +189,10 @@ async function pipeUpstream(request: UpstreamRequest, kind: ProviderKind, signal
         const message = error instanceof Error ? error.message : "The provider closed the stream.";
         send({ error: message.slice(0, 500) });
       } finally {
-        controller.close();
+        if (!cancelled) controller.close();
       }
     },
+    cancel() { cancelled = true; cancellation.abort(); },
   });
   return new Response(stream, {
     headers: {

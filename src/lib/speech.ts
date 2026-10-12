@@ -40,12 +40,37 @@ export function startDictation(onText: (text: string) => void, onEnd?: () => voi
   return { stop: () => recognition.stop() };
 }
 
-export function speak(text: string): void {
+export function speak(text: string, voiceURI?: string, rate = 1): void {
   if (!speechOutputAvailable()) return;
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text.slice(0, 4000));
   utterance.lang = navigator.language || "en-US";
+  if (voiceURI) utterance.voice = window.speechSynthesis.getVoices().find((voice) => voice.voiceURI === voiceURI) || null;
+  utterance.rate = Math.max(0.5, Math.min(2, rate));
   window.speechSynthesis.speak(utterance);
+}
+
+export type AudioRecording = { stop: () => Promise<File>; cancel: () => void };
+export async function recordAudio(): Promise<AudioRecording> {
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") throw new Error("Microphone recording requires a secure browser with MediaRecorder support.");
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const mime = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((type) => MediaRecorder.isTypeSupported(type));
+  const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  const chunks: Blob[] = []; let cancelled = false;
+  const finished = new Promise<File>((resolve, reject) => {
+    recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+    recorder.onerror = () => { clearTimeout(timer); stream.getTracks().forEach((track) => track.stop()); reject(new Error("Microphone recording failed.")); };
+    recorder.onstop = () => {
+      clearTimeout(timer); stream.getTracks().forEach((track) => track.stop());
+      if (cancelled) { reject(new DOMException("Recording cancelled", "AbortError")); return; }
+      const type = recorder.mimeType || "audio/webm";
+      resolve(new File(chunks, `recording.${type.includes("mp4") ? "m4a" : "webm"}`, { type }));
+    };
+  });
+  // Avoid an unhandled rejection if recording is cancelled before stop is awaited.
+  void finished.catch(() => undefined);
+  recorder.start(1000); const timer = setTimeout(() => { if (recorder.state !== "inactive") recorder.stop(); }, 120_000);
+  return { stop: () => { if (recorder.state !== "inactive") recorder.stop(); return finished; }, cancel: () => { cancelled = true; if (recorder.state !== "inactive") recorder.stop(); } };
 }
 
 export function stopSpeaking(): void {

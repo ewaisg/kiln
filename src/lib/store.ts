@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { workspaceStorage } from "@/lib/workspace-storage";
 import {
   DEFAULT_SETTINGS,
   newId,
@@ -34,7 +35,10 @@ function freshThread(mode: WorkMode): Thread {
   };
 }
 
-export function threadMode(thread: Pick<Thread, "mode"> | undefined, fallback: WorkMode = "build"): WorkMode {
+export function threadMode(
+  thread: Pick<Thread, "mode"> | undefined,
+  fallback: WorkMode = "build",
+): WorkMode {
   return thread?.mode ?? fallback;
 }
 
@@ -72,11 +76,13 @@ type State = {
   removeMcp: (id: string) => void;
   setToolGrant: (serverId: string, tool: string, allowed: boolean) => void;
   clearSecrets: () => void;
+  archiveThread: (id: string, archived: boolean) => void;
+  forkThread: (id: string, messageId: string, include?: boolean) => string;
 };
 
 export const useKiln = create<State>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       endpoints: [],
       activeId: "local",
       localModelId: null,
@@ -89,13 +95,19 @@ export const useKiln = create<State>()(
       toolGrants: {},
       setMode: (mode) =>
         set((state) => {
-          if (state.mode === mode && state.threads.some((thread) => thread.id === state.activeThreadId && threadMode(thread, "build") === mode)) {
+          if (
+            state.mode === mode &&
+            state.threads.some(
+              (thread) =>
+                thread.id === state.activeThreadId && threadMode(thread, "build") === mode,
+            )
+          ) {
             return { mode };
           }
           const match = state.threads.find((thread) => threadMode(thread, "build") === mode);
           if (match) return { mode, activeThreadId: match.id };
           const thread = freshThread(mode);
-          return { mode, threads: [thread, ...state.threads].slice(0, 40), activeThreadId: thread.id };
+          return { mode, threads: [thread, ...state.threads], activeThreadId: thread.id };
         }),
       setActiveId: (id) => set({ activeId: id }),
       setLocalModelId: (id) => set({ localModelId: id, activeId: "local" }),
@@ -119,20 +131,27 @@ export const useKiln = create<State>()(
         set((state) => {
           const thread = freshThread(state.mode);
           id = thread.id;
-          return { threads: [thread, ...state.threads].slice(0, 40), activeThreadId: thread.id };
+          return { threads: [thread, ...state.threads], activeThreadId: thread.id };
         });
         return id;
       },
-      selectThread: (id) => set({ activeThreadId: id }),
+      selectThread: (id) => {
+        const thread = get().threads.find((item) => item.id === id);
+        if (thread) set({ activeThreadId: id, mode: thread.mode ?? "build" });
+      },
       removeThread: (id) =>
         set((state) => {
           const gone = state.threads.find((thread) => thread.id === id);
           const mode = threadMode(gone, state.mode);
-          let threads = state.threads.filter((thread) => thread.id !== id);
+          const threads = state.threads.filter((thread) => thread.id !== id);
           const same = threads.filter((thread) => threadMode(thread, "build") === mode);
           if (same.length === 0) {
             const fresh = freshThread(mode);
-            return { threads: [fresh, ...threads].slice(0, 40), activeThreadId: fresh.id, mode };
+            return {
+              threads: [fresh, ...threads],
+              activeThreadId: state.activeThreadId === id ? fresh.id : state.activeThreadId,
+              mode: state.activeThreadId === id ? mode : state.mode,
+            };
           }
           const activeThreadId = state.activeThreadId === id ? same[0].id : state.activeThreadId;
           return { threads, activeThreadId };
@@ -168,38 +187,56 @@ export const useKiln = create<State>()(
         set((state) => ({
           threads: state.threads.map((thread) =>
             thread.id === threadId
-              ? { ...thread, messages: thread.messages.filter((message) => message.id !== messageId) }
+              ? {
+                  ...thread,
+                  messages: thread.messages.filter((message) => message.id !== messageId),
+                }
               : thread,
           ),
         })),
       titleIfBlank: (threadId, title) =>
         set((state) => ({
           threads: state.threads.map((thread) =>
-            thread.id === threadId && (thread.title === "New chat" || thread.title === "New build") ? { ...thread, title } : thread,
+            thread.id === threadId && (thread.title === "New chat" || thread.title === "New build")
+              ? { ...thread, title }
+              : thread,
           ),
         })),
       renameThread: (threadId, title) =>
         set((state) => ({
           threads: state.threads.map((thread) =>
-            thread.id === threadId ? { ...thread, title: title.trim().slice(0, 80) || thread.title } : thread,
+            thread.id === threadId
+              ? { ...thread, title: title.trim().slice(0, 80) || thread.title }
+              : thread,
           ),
         })),
       setThreadFolder: (threadId, folderId) =>
         set((state) => ({
-          threads: state.threads.map((thread) => (thread.id === threadId ? { ...thread, folderId: folderId ?? undefined } : thread)),
+          threads: state.threads.map((thread) =>
+            thread.id === threadId ? { ...thread, folderId: folderId ?? undefined } : thread,
+          ),
         })),
       addFolder: (name) =>
         set((state) => ({
-          folders: [...state.folders, { id: newId(), name: name.trim().slice(0, 40) || "Folder" }].slice(0, 20),
+          folders: [
+            ...state.folders,
+            { id: newId(), name: name.trim().slice(0, 40) || "Folder" },
+          ].slice(0, 20),
         })),
       renameFolder: (id, name) =>
         set((state) => ({
-          folders: state.folders.map((folder) => (folder.id === id ? { ...folder, name: name.trim().slice(0, 40) || folder.name } : folder)),
+          folders: state.folders.map((folder) =>
+            folder.id === id
+              ? { ...folder, name: name.trim().slice(0, 40) || folder.name }
+              : folder,
+          ),
         })),
       removeFolder: (id) =>
         set((state) => ({
           folders: state.folders.filter((folder) => folder.id !== id),
-          threads: state.threads.map((thread) => (thread.folderId === id ? { ...thread, folderId: undefined } : thread)),
+          threads: state.threads.map((thread) =>
+            thread.folderId === id ? { ...thread, folderId: undefined } : thread,
+          ),
         })),
       truncateFrom: (threadId, messageId) =>
         set((state) => ({
@@ -219,7 +256,9 @@ export const useKiln = create<State>()(
       removeMcp: (id) =>
         set((state) => ({
           mcpServers: state.mcpServers.filter((item) => item.id !== id),
-          toolGrants: Object.fromEntries(Object.entries(state.toolGrants).filter(([key]) => !key.startsWith(`${id}:`))),
+          toolGrants: Object.fromEntries(
+            Object.entries(state.toolGrants).filter(([key]) => !key.startsWith(`${id}:`)),
+          ),
         })),
       setToolGrant: (serverId, tool, allowed) =>
         set((state) => ({ toolGrants: { ...state.toolGrants, [`${serverId}:${tool}`]: allowed } })),
@@ -228,12 +267,68 @@ export const useKiln = create<State>()(
           endpoints: state.endpoints.map((endpoint) => ({ ...endpoint, apiKey: "" })),
           mcpServers: state.mcpServers.map((server) => ({ ...server, token: "" })),
         })),
+      archiveThread: (id, archived) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === id ? { ...thread, archived } : thread,
+          ),
+        })),
+      forkThread: (id, messageId, include = true) => {
+        const source = get().threads.find((thread) => thread.id === id);
+        const index = source?.messages.findIndex((message) => message.id === messageId) ?? -1;
+        if (!source || index < 0) return id;
+        const branch: Thread = {
+          ...source,
+          id: newId(),
+          title: `${source.title} · branch`,
+          messages: source.messages
+            .slice(0, index + (include ? 1 : 0))
+            .map((message) => ({ ...message })),
+          parentThreadId: source.id,
+          archived: false,
+          updatedAt: Date.now(),
+        };
+        set((state) => ({
+          threads: [branch, ...state.threads],
+          activeThreadId: branch.id,
+          mode: branch.mode ?? "build",
+        }));
+        return branch.id;
+      },
     }),
     {
       name: "kiln-v1",
+      storage: createJSONStorage(() => workspaceStorage),
+      version: 2,
+      migrate: (persisted) => {
+        const state = persisted as Partial<State>;
+        return {
+          endpoints: state.endpoints ?? [],
+          activeId: state.activeId ?? "local",
+          localModelId: state.localModelId ?? null,
+          threads: state.threads ?? [blankThread()],
+          activeThreadId: state.activeThreadId ?? WELCOME_ID,
+          mode: state.mode ?? "chat",
+          folders: state.folders ?? [],
+          mcpServers: state.mcpServers ?? [],
+          toolGrants: state.toolGrants ?? {},
+          settings: {
+            ...DEFAULT_SETTINGS,
+            ...state.settings,
+            rememberCredentials: state.settings?.rememberCredentials ?? true,
+          },
+        };
+      },
+      merge: (persisted, current) => {
+        const state = persisted as Partial<State> | undefined;
+        return { ...current, ...state, settings: { ...DEFAULT_SETTINGS, ...state?.settings } };
+      },
       skipHydration: true,
       partialize: (state) => ({
-        endpoints: state.endpoints,
+        endpoints: state.endpoints.map((endpoint) => ({
+          ...endpoint,
+          apiKey: state.settings.rememberCredentials ? endpoint.apiKey : "",
+        })),
         activeId: state.activeId,
         localModelId: state.localModelId,
         threads: state.threads,
@@ -241,7 +336,10 @@ export const useKiln = create<State>()(
         settings: state.settings,
         mode: state.mode,
         folders: state.folders,
-        mcpServers: state.mcpServers,
+        mcpServers: state.mcpServers.map((server) => ({
+          ...server,
+          token: state.settings.rememberCredentials ? server.token : "",
+        })),
         toolGrants: state.toolGrants,
       }),
     },

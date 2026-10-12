@@ -1,22 +1,37 @@
 # Kiln
 
-A coding chat that runs in the browser. Chat talks things through. Build writes files, scripts, and small apps you can preview.
+Kiln is a private, device-owned AI workspace for conversations, coding, local models, media, and approved tools. Chat and Build share providers and history; Build retains sandboxed code previews and file downloads.
 
-## Use it
+## Run
 
-1. Open Kiln. Chat is a conversation. Build is for files and small apps.
-2. Local model: open the model chip, search the list, and choose one. The file downloads into browser storage, or into a folder you pick in Chrome or Edge on a computer. Cancel stops the download. Use loads it on the CPU. The GPU stays off because it was corrupting replies.
-3. Hosted model: add Grok, OpenAI, Claude, Azure, LM Studio, or Ollama. The key stays in this browser. LM Studio and Ollama are called from the device, so they need CORS and, from a phone, the computer’s LAN address.
-4. Attach a document, image, audio, or video. Text is included. Images are sent to cloud models that accept them. Audio and video play here; the model only sees the name.
-5. Draw appears only after you select a saved OpenAI or Grok endpoint. It bills that account. Video generation is not available.
-6. Tools connects to an MCP server that already speaks HTTP. Kiln does not start one. Allow a tool, then run it. Insert the result into the message if you want the model to see it.
-7. Studio holds prompts, temperature, context, theme, export, and install.
+Use Node 22 or newer (verified on Node 24) and install with `npm ci`. `npm run dev` starts the workspace using its app environment wrapper. On Windows, `powershell -File startup.ps1` starts it in the background; `startup.sh` retains the Linux preview/revive contract. `npm run build` produces the Nitro/Vercel build. `npm run preview:restart` serves the built output for verification. Nothing is publicly deployed by these commands. The Vercel CLI is intentionally no longer a runtime dependency.
 
-On Windows, Studio’s installer downloads Install-Kiln.bat. Double-click it to open Kiln in its own window and add Start menu and desktop shortcuts.
+## Configure and use
 
-## Limits
+- **Providers:** add OpenAI, xAI, Anthropic, Azure, LM Studio, Ollama, or a custom OpenAI-compatible endpoint. Test/discover lists models your endpoint actually returns. Capability metadata is shown when published; otherwise explicitly confirm capabilities or consult the provider. Discovery alone does not prove a model can process every modality. Local endpoints are called directly from this device and need appropriate CORS/network access.
+- **Conversations:** stream/stop, edit/resend, regenerate into a preserved branch, branch at an answer, search history, organize folders, rename, archive/restore, delete with confirmation, and export. Markdown includes tables, highlighted code, math, copy/save, and sandboxed runnable previews. Keyboard shortcuts: Ctrl/Cmd+K searches, Ctrl/Cmd+N creates a chat, Ctrl/Cmd+, opens settings.
+- **Model library:** search the live Hugging Face GGUF catalog, inspect actual file variants, quantization, size and approximate RAM, import a GGUF, or use a URL. Downloads show progress and retain partial checkpoints on cancellation. Retry uses HTTP Range when the host supports it; otherwise it restarts. Split files and projector-only files are explicitly unavailable in this importer. Loading performs the final architecture compatibility check.
+- **Storage:** models use browser OPFS or an explicitly selected Chrome/Edge folder. Folder handles are pinned to each file so changing the default folder does not move existing records. A browser folder picker is not unrestricted native filesystem access. Browser data can be evicted; export important conversations and keep model backups. Actual selected-folder deletion requires permission.
+- **Performance:** Auto/Balanced request partial WebGPU offload when available; Quality requests full offload and larger context; Saver uses CPU. GPU loading failures retry on CPU. Memory/thread availability informs limits, rather than treating every phone identically. Multiple WASM CPU threads require cross-origin isolation. A repetition guard cancels collapsed output while preserving the response and showing an error. See the evidence and limits in `docs/VERIFICATION.md`.
+- **Attachments:** drag/drop or select text, PDF, DOCX, images, audio, or video. Documents send extracted text; audio uses your transcription provider; videos send up to six timestamped frames. Local text chat can use a separately configured vision provider for visual observations. Unsupported files fail explicitly instead of sending only their names. Uploads are capped at 24 MB; extraction and sparse video sampling have stated limits.
+- **Media studio:** set independent endpoints/model IDs for vision, images, transcription, speech, and video. Image prompts/reference edits, recording/uploaded transcription, editable transcripts, speech voice selection/playback/download, and async video create/status/playback/download use real provider adapters. Voice conversations offer recording, reviewed transcripts, sending, optional spoken replies, and interruption. Stopping a video request does not guarantee cancellation of an already submitted paid provider job.
+- **Tools & connectors:** remote HTTP MCP supports bearer tokens and public-client OAuth/S256 PKCE. Register the callback displayed in Tools with the service and supply its public client ID. Tools are discovered from the configured server; only explicitly permitted tools reach a model and can run automatically. Revoking permission applies during execution. MCP service integrations expose your service's actual data, subject to its own authorization. Local Windows stdio MCP uses the authenticated companion; see `docs/desktop.md`.
+- **Settings:** system instructions, temperature, response/context limits, reusable prompts, appearance, larger text, reduced motion, storage/privacy, and workspace configuration import/export. Imports merge validated data rather than overwrite existing conversations. Exports omit provider keys, MCP tokens, and tool grants. Model files and generated blobs are device-owned and are not packaged into a workspace export.
 
-- Models stay on this device. A chosen folder works where the browser can pick one.
-- Phone inference uses one CPU core and a short reply so the device stays cooler. The first token is still slow.
-- MCP, image models, and cloud chat need a server or key you supply. A failed connection shows the real error.
-- Kiln does not transcribe audio, watch video, or generate video.
+## Credentials and security
+
+No API credentials are bundled. New installs keep provider keys/MCP tokens in memory unless you explicitly enable remembering them. Existing saved keys are preserved by migration; turn remembering off or clear credentials in Settings to remove them from persisted state. Remembered credentials are readable by code on the same origin, not an encrypted server vault. The application has no cross-device account sync or server credential database.
+
+Hosted calls carry your chosen credentials through stateless same-origin relays. Relays validate and pin public DNS addresses, reject redirects, apply time/size bounds, and avoid logging credential/content data. Local providers remain device-local. Tool outputs, retrieved content, documents, and visible image text are untrusted model inputs. Tool permission grants authorize future automatic execution; grant only scopes you intend a model to use. The native companion runs under your Windows user and is not a process sandbox.
+
+See `docs/architecture.md` for the audit/security boundaries, `docs/MEDIA.md` for media setup and provider-specific limits, `docs/desktop.md` for the Windows component, and `docs/VERIFICATION.md` for reproducible verification and live versus mocked coverage.
+
+## Checks
+
+`npm test` runs platform, application, provider-contract, and companion tests on Windows/Linux. `npm run typecheck`, `npm run lint`, and `npm run build` are the engineering gates. Browser scripts live in `scripts/`; install Playwright Chromium for headless smoke checks or use the installed Chrome channel used by workflow scripts. `scripts/local-runtime-qa.mjs` intentionally downloads a public 105 MB GGUF to exercise actual inference; it deletes its test model afterward. Provider workflow tests use clearly identified mocks and do not spend API quota.
+
+## Specific limits
+
+The browser GGUF importer does not load multimodal projectors or split GGUF sets; use cloud vision or a capable LM Studio/Ollama endpoint. Native continuous video/audio understanding is not implemented; video analysis uses sparse frames and a separately supplied audio track for transcription. The media adapter targets the OpenAI media protocol; Azure-specific or non-compatible vendor media APIs require an additional adapter. OAuth requires a registered public client ID; refresh-token renewal, dynamic client registration, and confidential-client secrets are not implemented. Expired access tokens require reauthorization. Prices and billed usage are not guessed: inspect your provider's billing dashboard.
+
+`npm audit` currently reports three moderate advisories through Mammoth's unused CLI `argparse/sprintf-js` dependency. Browser DOCX processing only calls raw-text extraction. No high or critical advisories remain after removing the unused Vercel CLI and updating math dependencies.

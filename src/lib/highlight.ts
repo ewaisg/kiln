@@ -1,14 +1,14 @@
-const KEYWORDS =
-  /\b(const|let|var|function|return|if|else|for|while|class|import|from|export|async|await|def|elif|None|True|False|SELECT|FROM|WHERE|AND|OR|INSERT|UPDATE|CREATE|TABLE|fn|pub|struct|impl|package|func)\b/g;
-
+const TOKEN = /(\/\/[^\n]*|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:const|let|var|function|return|if|else|for|while|class|import|from|export|async|await|def|elif|None|True|False|SELECT|FROM|WHERE|AND|OR|INSERT|UPDATE|CREATE|TABLE|fn|pub|struct|impl|package|func)\b)/g;
+const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+/** Tokenize before escaping; never interpret model-generated code as HTML. */
 export function highlightCode(code: string): string {
-  const escaped = code.replace(/&/g, "&").replace(/</g, "<").replace(/>/g, ">");
-  const marked = escaped
-    .replace(/(\/\/[^\n]*|#[^\n]*)/g, "\u0000c$1\u0000")
-    .replace(/("(?:\\.|[^&])*?"|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g, "\u0000s$1\u0000")
-    .replace(KEYWORDS, "\u0000k$1\u0000");
-  return marked
-    .replace(/\u0000c([\s\S]*?)\u0000/g, '<span class="tok-c">$1</span>')
-    .replace(/\u0000s([\s\S]*?)\u0000/g, '<span class="tok-s">$1</span>')
-    .replace(/\u0000k([\s\S]*?)\u0000/g, '<span class="tok-k">$1</span>');
+  let output = "", start = 0;
+  for (const match of code.matchAll(TOKEN)) {
+    output += escape(code.slice(start, match.index));
+    const token = match[0];
+    const kind = token.startsWith("//") || token.startsWith("#") ? "c" : /^["']/.test(token) ? "s" : "k";
+    output += `<span class="tok-${kind}">${escape(token)}</span>`;
+    start = match.index + token.length;
+  }
+  return output + escape(code.slice(start));
 }

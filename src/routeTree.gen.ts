@@ -13,7 +13,11 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiChatRouteImport } from './routes/api/chat'
 import { Route as ApiImageRouteImport } from './routes/api/image'
 import { Route as ApiMcpRouteImport } from './routes/api/mcp'
+import { Route as ApiMcpOauthRouteImport } from './routes/api/mcp-oauth'
+import { Route as ApiMediaRouteImport } from './routes/api/media'
 import { Route as ApiModelsRouteImport } from './routes/api/models'
+import { Route as ApiToolChatRouteImport } from './routes/api/tool-chat'
+import { Route as McpCallbackRouteImport } from './routes/mcp/callback'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -35,9 +39,29 @@ const ApiMcpRoute = ApiMcpRouteImport.update({
   path: '/api/mcp',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiMcpOauthRoute = ApiMcpOauthRouteImport.update({
+  id: '/api/mcp-oauth',
+  path: '/api/mcp-oauth',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiMediaRoute = ApiMediaRouteImport.update({
+  id: '/api/media',
+  path: '/api/media',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiModelsRoute = ApiModelsRouteImport.update({
   id: '/api/models',
   path: '/api/models',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiToolChatRoute = ApiToolChatRouteImport.update({
+  id: '/api/tool-chat',
+  path: '/api/tool-chat',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const McpCallbackRoute = McpCallbackRouteImport.update({
+  id: '/mcp/callback',
+  path: '/mcp/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
 
@@ -46,14 +70,22 @@ export interface FileRoutesByFullPath {
   '/api/chat': typeof ApiChatRoute
   '/api/image': typeof ApiImageRoute
   '/api/mcp': typeof ApiMcpRoute
+  '/api/mcp-oauth': typeof ApiMcpOauthRoute
+  '/api/media': typeof ApiMediaRoute
   '/api/models': typeof ApiModelsRoute
+  '/api/tool-chat': typeof ApiToolChatRoute
+  '/mcp/callback': typeof McpCallbackRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/chat': typeof ApiChatRoute
   '/api/image': typeof ApiImageRoute
   '/api/mcp': typeof ApiMcpRoute
+  '/api/mcp-oauth': typeof ApiMcpOauthRoute
+  '/api/media': typeof ApiMediaRoute
   '/api/models': typeof ApiModelsRoute
+  '/api/tool-chat': typeof ApiToolChatRoute
+  '/mcp/callback': typeof McpCallbackRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -61,14 +93,46 @@ export interface FileRoutesById {
   '/api/chat': typeof ApiChatRoute
   '/api/image': typeof ApiImageRoute
   '/api/mcp': typeof ApiMcpRoute
+  '/api/mcp-oauth': typeof ApiMcpOauthRoute
+  '/api/media': typeof ApiMediaRoute
   '/api/models': typeof ApiModelsRoute
+  '/api/tool-chat': typeof ApiToolChatRoute
+  '/mcp/callback': typeof McpCallbackRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/chat' | '/api/image' | '/api/mcp' | '/api/models'
+  fullPaths:
+    | '/'
+    | '/api/chat'
+    | '/api/image'
+    | '/api/mcp'
+    | '/api/mcp-oauth'
+    | '/api/media'
+    | '/api/models'
+    | '/api/tool-chat'
+    | '/mcp/callback'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/chat' | '/api/image' | '/api/mcp' | '/api/models'
-  id: '__root__' | '/' | '/api/chat' | '/api/image' | '/api/mcp' | '/api/models'
+  to:
+    | '/'
+    | '/api/chat'
+    | '/api/image'
+    | '/api/mcp'
+    | '/api/mcp-oauth'
+    | '/api/media'
+    | '/api/models'
+    | '/api/tool-chat'
+    | '/mcp/callback'
+  id:
+    | '__root__'
+    | '/'
+    | '/api/chat'
+    | '/api/image'
+    | '/api/mcp'
+    | '/api/mcp-oauth'
+    | '/api/media'
+    | '/api/models'
+    | '/api/tool-chat'
+    | '/mcp/callback'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -76,7 +140,11 @@ export interface RootRouteChildren {
   ApiChatRoute: typeof ApiChatRoute
   ApiImageRoute: typeof ApiImageRoute
   ApiMcpRoute: typeof ApiMcpRoute
+  ApiMcpOauthRoute: typeof ApiMcpOauthRoute
+  ApiMediaRoute: typeof ApiMediaRoute
   ApiModelsRoute: typeof ApiModelsRoute
+  ApiToolChatRoute: typeof ApiToolChatRoute
+  McpCallbackRoute: typeof McpCallbackRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -109,11 +177,39 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiMcpRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/mcp-oauth': {
+      id: '/api/mcp-oauth'
+      path: '/api/mcp-oauth'
+      fullPath: '/api/mcp-oauth'
+      preLoaderRoute: typeof ApiMcpOauthRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/media': {
+      id: '/api/media'
+      path: '/api/media'
+      fullPath: '/api/media'
+      preLoaderRoute: typeof ApiMediaRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/models': {
       id: '/api/models'
       path: '/api/models'
       fullPath: '/api/models'
       preLoaderRoute: typeof ApiModelsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/tool-chat': {
+      id: '/api/tool-chat'
+      path: '/api/tool-chat'
+      fullPath: '/api/tool-chat'
+      preLoaderRoute: typeof ApiToolChatRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/mcp/callback': {
+      id: '/mcp/callback'
+      path: '/mcp/callback'
+      fullPath: '/mcp/callback'
+      preLoaderRoute: typeof McpCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
   }
@@ -124,7 +220,11 @@ const rootRouteChildren: RootRouteChildren = {
   ApiChatRoute: ApiChatRoute,
   ApiImageRoute: ApiImageRoute,
   ApiMcpRoute: ApiMcpRoute,
+  ApiMcpOauthRoute: ApiMcpOauthRoute,
+  ApiMediaRoute: ApiMediaRoute,
   ApiModelsRoute: ApiModelsRoute,
+  ApiToolChatRoute: ApiToolChatRoute,
+  McpCallbackRoute: McpCallbackRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -1,4 +1,11 @@
 import type { Endpoint, ProviderKind, WireMessage } from "@/lib/types";
+import { sseData } from "@/lib/sse";
+import { reportedCapabilities } from "@/lib/provider-capabilities";
+import type { Capability } from "@/lib/types";
+const discoveredCapabilities = new Map<string, Record<string, Capability[]>>();
+export function getDiscoveredCapabilities(endpointId: string, model: string): Capability[] | null {
+  return discoveredCapabilities.get(endpointId)?.[model] ?? null;
+}
 import {
   buildChatRequest,
   buildModelsRequest,
@@ -30,6 +37,7 @@ export async function streamChat(args: {
       apiKey: args.endpoint.apiKey,
       model: args.endpoint.model,
       apiVersion: args.endpoint.apiVersion,
+      chatProfile: args.endpoint.chatProfile,
       temperature: args.temperature,
       maxTokens: args.maxTokens,
       messages: args.messages,
@@ -55,6 +63,7 @@ async function streamDirect(args: {
       headers: request.headers,
       body: JSON.stringify(request.body),
       signal: args.signal,
+      redirect: "error",
     });
   } catch (error) {
     if (isAbort(error)) throw error;
@@ -79,49 +88,34 @@ async function readRelay(response: Response, onDelta: (full: string) => void): P
   if (!response.ok) {
     throw new Error(await errorText(response));
   }
-  if (!response.body) throw new Error("Empty response from the relay.");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let full = "";
-  while (true) {
-    const step = await reader.read();
-    if (step.done) break;
-    buffer += decoder.decode(step.value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-      const data = trimmed.slice(5).trim();
-      if (!data) continue;
-      let json: { t?: string; error?: string };
-      try {
-        json = JSON.parse(data) as { t?: string; error?: string };
-      } catch {
-        continue;
-      }
-      if (json.error) throw new Error(json.error);
-      if (json.t) {
-        full += json.t;
-        onDelta(full);
-      }
+  for await (const data of sseData(response)) {
+    const json = JSON.parse(data) as { t?: string; error?: string };
+    if (json.error) throw new Error(json.error);
+    if (json.t) {
+      full += json.t;
+      onDelta(full);
     }
   }
   return full;
 }
 
-export async function listRemoteModels(endpoint: Endpoint, signal?: AbortSignal): Promise<string[]> {
+export async function listRemoteModels(
+  endpoint: Endpoint,
+  signal?: AbortSignal,
+): Promise<string[]> {
   if (shouldDirect(endpoint)) {
     const request = buildModelsRequest(endpoint);
     let response: Response;
     try {
-      response = await fetch(request.url, { headers: request.headers, signal });
+      response = await fetch(request.url, { headers: request.headers, signal, redirect: "error" });
     } catch {
       throw new Error(DIRECT_FAIL);
     }
     if (!response.ok) throw new Error(await errorText(response));
-    return parseModelIds(await response.json());
+    const payload: unknown = await response.json();
+    discoveredCapabilities.set(endpoint.id, reportedCapabilities(payload));
+    return parseModelIds(payload);
   }
   const response = await fetch("/api/models", {
     method: "POST",
@@ -135,14 +129,21 @@ export async function listRemoteModels(endpoint: Endpoint, signal?: AbortSignal)
     }),
     signal,
   });
-  const json = (await response.json()) as { ids?: string[]; error?: string };
+  const json = (await response.json()) as {
+    ids?: string[];
+    error?: string;
+    capabilities?: Record<string, Capability[]>;
+  };
   if (!response.ok) throw new Error(json.error || "Could not list models.");
+  discoveredCapabilities.set(endpoint.id, json.capabilities ?? {});
   return json.ids ?? [];
 }
 
 export function isAbort(error: unknown): boolean {
   if (error instanceof DOMException && error.name === "AbortError") return true;
-  return error instanceof Error && (error.name === "AbortError" || error.name === "WllamaAbortError");
+  return (
+    error instanceof Error && (error.name === "AbortError" || error.name === "WllamaAbortError")
+  );
 }
 
 export function kindNeedsKey(kind: ProviderKind): boolean {
