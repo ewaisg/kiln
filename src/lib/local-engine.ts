@@ -20,8 +20,34 @@ export function isLoadCancelled(error: unknown): boolean {
   return error instanceof Error && error.name === "LoadCancelled";
 }
 
-export function loadedModelKey(): string {
-  return loadedKey;
+export type RuntimePlan = {
+  threads: number;
+  batch: number;
+  ctx: number;
+  maxTokens: number;
+  note: string;
+};
+
+export function planRuntime(requestedCtx: number, requestedTokens: number): RuntimePlan {
+  const nav = typeof navigator === "undefined" ? null : navigator;
+  const cores = nav?.hardwareConcurrency || 2;
+  const memory = (nav as (Navigator & { deviceMemory?: number }) | null)?.deviceMemory ?? 4;
+  const phone =
+    !!nav &&
+    window.matchMedia("(pointer: coarse)").matches &&
+    Math.min(window.screen.width, window.screen.height) < 900;
+  // SharedArrayBuffer is required for more than one wasm thread, and this site
+  // does not isolate the origin, so extra cores would not actually run.
+  const threads = typeof crossOriginIsolated === "boolean" && crossOriginIsolated && !phone ? Math.min(2, Math.max(1, cores - 1)) : 1;
+  const ctxCap = memory <= 3 ? 1024 : phone ? 2048 : memory >= 8 ? 4096 : 3072;
+  const ctx = Math.max(512, Math.min(requestedCtx, ctxCap));
+  const maxTokens = Math.max(64, Math.min(requestedTokens, phone ? 512 : 768));
+  const note = phone
+    ? "One CPU core, so the rest of the phone stays cool. The GPU is idle because it was scrambling replies."
+    : threads > 1
+      ? `${threads} CPU cores. The GPU is idle so replies stay coherent.`
+      : "One CPU core. The GPU is idle so replies stay coherent.";
+  return { threads, batch: phone ? 64 : 128, ctx, maxTokens, note };
 }
 
 async function getEngine(): Promise<Engine> {
@@ -47,11 +73,12 @@ export function ensureLocal(
   nCtx: number,
   onProgress: (label: string, ratio: number | null) => void,
 ): Promise<void> {
-  const key = `${model.id}:${nCtx}`;
+  const plan = planRuntime(nCtx, 512);
+  const key = `${model.id}:${plan.ctx}:${plan.threads}`;
   if (engine?.isModelLoaded() && loadedKey === key) return Promise.resolve();
   if (inflight?.key === key) return inflight.promise;
   const mine = ++ticket;
-  const promise = chain.then(() => runLoad(model, nCtx, key, mine, onProgress));
+  const promise = chain.then(() => runLoad(model, plan, key, mine, onProgress));
   chain = promise.then(
     () => undefined,
     () => undefined,
@@ -64,7 +91,7 @@ export function ensureLocal(
 
 async function runLoad(
   model: SavedModel,
-  nCtx: number,
+  plan: RuntimePlan,
   key: string,
   mine: number,
   onProgress: (label: string, ratio: number | null) => void,
@@ -79,13 +106,12 @@ async function runLoad(
   if (mine !== ticket) throw new LoadCancelled();
   const current = await getEngine();
   const params = {
-    n_ctx: nCtx,
-    n_threads: 1,
-    // WebGPU is on by default and corrupts sampling on phones: the model
-    // loops on the same tokens ("vid vid", "clear clear") for every GGUF.
+    n_ctx: plan.ctx,
+    n_threads: plan.threads,
+    // WebGPU corrupts sampling on phones and also runs the GPU hot.
     n_gpu_layers: 0,
     flash_attn: false,
-    n_batch: Math.min(128, nCtx),
+    n_batch: Math.min(plan.batch, plan.ctx),
     progressCallback: ({ loaded, total }: { loaded: number; total: number }) => {
       if (mine !== ticket) return;
       onProgress("Downloading", total > 0 ? loaded / total : null);

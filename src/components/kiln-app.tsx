@@ -11,7 +11,7 @@ import {
   saveModel,
   writeOpfs,
 } from "@/lib/library";
-import { completeLocal, ensureLocal, isLoadCancelled, unloadLocal } from "@/lib/local-engine";
+import { completeLocal, ensureLocal, isLoadCancelled, planRuntime, unloadLocal } from "@/lib/local-engine";
 import { copyText } from "@/lib/preview-doc";
 import { useKiln, threadMode } from "@/lib/store";
 import {
@@ -35,7 +35,7 @@ type Tab = "endpoints" | "models" | "studio";
 type LoadState =
   | { phase: "idle" }
   | { phase: "loading"; label: string; ratio: number | null }
-  | { phase: "ready"; name: string }
+  | { phase: "ready"; name: string; note: string }
   | { phase: "error"; message: string };
 
 type InstallPrompt = Event & {
@@ -163,7 +163,7 @@ export function KilnApp() {
       await ensureLocal(model, useKiln.getState().settings.localCtx, (label, ratio) => {
         setLoad({ phase: "loading", label, ratio });
       });
-      setLoad({ phase: "ready", name: model.name });
+      setLoad({ phase: "ready", name: model.name, note: planRuntime(useKiln.getState().settings.localCtx, 512).note });
     } catch (error) {
       if (isLoadCancelled(error)) return;
       setLoad({ phase: "error", message: explain(error) });
@@ -207,6 +207,7 @@ export function KilnApp() {
         ? `Local · ${models.find((model) => model.id === state.localModelId)?.name ?? "model"}`
         : endpointLabel(active, null, state.activeId);
     useKiln.getState().appendMessage(threadId, { id: assistantId, role: "assistant", content: "" }, via);
+    setLive({ id: assistantId, content: "" });
 
     const history = useKiln
       .getState()
@@ -242,9 +243,10 @@ export function KilnApp() {
       if (state.activeId === "local") {
         const saved = (await listModels()).find((model) => model.id === useKiln.getState().localModelId);
         if (!saved) throw new Error("Choose a model on this device first.");
-        await ensureLocal(saved, settings.localCtx, (label, ratio) => setLoad({ phase: "loading", label, ratio }));
-        setLoad({ phase: "ready", name: saved.name });
-        await completeLocal(messages, settings.temperature, Math.min(settings.maxTokens, 1024), controller.signal, paint);
+        const plan = planRuntime(settings.localCtx, settings.maxTokens);
+        await ensureLocal(saved, plan.ctx, (label, ratio) => setLoad({ phase: "loading", label, ratio }));
+        setLoad({ phase: "ready", name: saved.name, note: plan.note });
+        await completeLocal(messages, settings.temperature, plan.maxTokens, controller.signal, paint);
       } else if (active) {
         await streamChat({
           endpoint: active,
@@ -292,7 +294,7 @@ export function KilnApp() {
       : load.phase === "error"
         ? load.message
         : load.phase === "ready"
-          ? `${load.name} is ready on this device`
+          ? `${load.name} is ready. ${load.note}`
           : "";
 
   const mode = threadMode(thread, kiln.mode);
@@ -399,11 +401,13 @@ export function KilnApp() {
                         <p className="text-danger">{content}</p>
                       ) : content ? (
                         <Markdown text={content} onPreview={openPreview} />
+                      ) : streaming ? (
+                        <Writing />
                       ) : null
                     ) : (
                       <p className="whitespace-pre-wrap">{content}</p>
                     )}
-                    {streaming ? <span className="caret" /> : null}
+                    {streaming && content ? <span className="caret" /> : null}
                   </div>
                   {message.role === "assistant" && content && !streaming ? (
                     <div className="mt-2 flex gap-2">
@@ -620,6 +624,17 @@ function Overlay({ title, onClose, children }: { title: string; onClose: () => v
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">{children}</div>
       </div>
     </div>
+  );
+}
+
+function Writing() {
+  return (
+    <p className="writing" role="status">
+      <span />
+      <span />
+      <span />
+      Thinking
+    </p>
   );
 }
 
