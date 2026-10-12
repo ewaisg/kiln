@@ -83,6 +83,11 @@ test("the wrapped command runs with the app env applied", async () => {
   assert.equal(stdout, "false");
 });
 
+test("the wrapped Vite command runs through Node", async () => {
+  const { stdout } = await execFileAsync(process.execPath, [WRAPPER, "vite", "--version"]);
+  assert.match(stdout, /vite\/\d/);
+});
+
 test("the wrapped command sees an explicit override, not the file value", async () => {
   const { stdout } = await execFileAsync(
     process.execPath,
