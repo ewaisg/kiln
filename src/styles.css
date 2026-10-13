@@ -515,9 +515,13 @@
   }
   .workspace-tabs {
     gap: 6px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    margin-bottom: 16px;
   }
   .workspace-tabs > button {
     min-width: 70px;
+    flex-shrink: 0;
     font-size: 12px;
   }
   .welcome {

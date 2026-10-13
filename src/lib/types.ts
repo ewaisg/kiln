@@ -269,6 +269,21 @@ export type SavedModel = {
   where?: string;
   folderKey?: string;
   createdAt: number;
+  config?: ModelConfig;
+  metadata?: { architecture?: string; quantization?: string; parameters?: number; contextLength?: number };
+  linked?: boolean;
+};
+
+export type ModelConfig = {
+  context: number;
+  profile: PerformanceProfile;
+  gpuLayers?: number;
+  threads?: number;
+  batch?: number;
+  temperature?: number;
+  maxTokens?: number;
+  topP?: number;
+  repeatPenalty?: number;
 };
 
 export function presetByKind(kind: ProviderKind): Preset {

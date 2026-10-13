@@ -26,7 +26,8 @@ export function parseCatalogFiles(
       const file = row.rfilename;
       const bytes = row.lfs?.size ?? row.size ?? 0;
       const quantization =
-        file.match(/(?:IQ\d[_A-Z0-9]*|Q\d[_A-Z0-9]*|BF16|F16|F32)(?=\.|-)/i)?.[0] ?? "Unspecified";
+        file.match(/(?:MXFP4|IQ\d[_A-Z0-9]*|Q\d[_A-Z0-9]*|BF16|F16|F32)(?=\.|-)/i)?.[0] ??
+        "Unspecified";
       const compatible = !/mmproj|vision|projector|\d{5}-of-\d{5}/i.test(file);
       return {
         id: `${repo}/${file}`,
@@ -49,7 +50,11 @@ export function parseCatalogFiles(
     .sort((a, b) => a.bytes - b.bytes);
 }
 export async function catalogFiles(repo: string, signal?: AbortSignal): Promise<CatalogItem[]> {
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error("Invalid model repository.");
+  if (
+    !/^[\w.-]+\/[\w.-]+$/.test(repo) ||
+    repo.split("/").some((part) => part === "." || part === "..")
+  )
+    throw new Error("Invalid model repository.");
   if (cache.has(repo)) return cache.get(repo)!;
   const response = await fetch(`${API}/${repo}?blobs=true`, { signal });
   if (!response.ok)
@@ -62,21 +67,48 @@ export async function catalogFiles(repo: string, signal?: AbortSignal): Promise<
   return files;
 }
 export async function searchCatalog(query = "", signal?: AbortSignal): Promise<CatalogItem[]> {
+  return (await searchCatalogPage({ query }, signal)).items;
+}
+
+export type CatalogPageOptions = {
+  query?: string;
+  sort?: "downloads" | "lastModified" | "likes";
+  task?: string;
+  cursor?: string;
+  limit?: number;
+};
+export async function searchCatalogPage(
+  options: CatalogPageOptions = {},
+  signal?: AbortSignal,
+): Promise<{ items: CatalogItem[]; nextCursor: string | null }> {
   const params = new URLSearchParams({
     filter: "gguf",
-    search: query.trim(),
-    sort: "downloads",
+    search: options.query?.trim() ?? "",
+    sort: options.sort ?? "downloads",
     direction: "-1",
-    limit: "20",
+    limit: String(Math.max(1, Math.min(50, options.limit ?? 20))),
   });
-  const response = await fetch(`${API}?${params}`, { signal });
+  if (options.task) params.set("pipeline_tag", options.task);
+  let target = `${API}?${params}`;
+  if (options.cursor) {
+    const cursor = new URL(options.cursor);
+    if (
+      cursor.origin !== "https://huggingface.co" ||
+      cursor.pathname !== "/api/models" ||
+      cursor.username ||
+      cursor.password
+    )
+      throw new Error("Invalid catalog page cursor.");
+    target = cursor.href;
+  }
+  const response = await fetch(target, { signal });
   if (!response.ok)
     throw new Error(
       `Hugging Face catalog unavailable (${response.status}). You can still import a downloaded GGUF file.`,
     );
   const models = (await response.json()) as HubModel[];
   if (!Array.isArray(models)) throw new Error("Unexpected model catalog response.");
-  return models.map((model) => ({
+  const items = models.map((model) => ({
     id: model.id,
     name: model.id.split("/").pop() ?? model.id,
     repo: model.id,
@@ -86,4 +118,11 @@ export async function searchCatalog(query = "", signal?: AbortSignal): Promise<C
     blurb: `${model.id} · ${(model.downloads ?? 0).toLocaleString()} downloads${model.gated ? " · gated" : ""}`,
     format: "GGUF",
   }));
+  const link = response.headers.get("link");
+  const next = link
+    ?.split(/,\s*(?=<)/)
+    .find((part) => /rel=["']?next["']?/.test(part))
+    ?.match(/<([^>]+)>/)?.[1];
+  // The server's cursor avoids duplicates/skips as a live catalog changes.
+  return { items, nextCursor: next ?? null };
 }

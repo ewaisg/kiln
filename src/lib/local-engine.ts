@@ -1,5 +1,5 @@
 import { fileForModel } from "@/lib/library";
-import type { PerformanceProfile, SavedModel, WireMessage } from "@/lib/types";
+import type { ModelConfig, PerformanceProfile, SavedModel, WireMessage } from "@/lib/types";
 import { useKiln } from "@/lib/store";
 
 type Engine = import("@wllama/wllama").Wllama;
@@ -18,14 +18,22 @@ let chain: Promise<void> = Promise.resolve();
 let inflight: { key: string; promise: Promise<void> } | null = null;
 let generating = false;
 let gpuFailed = false;
+let loadedConfig: ModelConfig | undefined;
 let diagnostic: {
   backend: "cpu" | "webgpu-requested";
   reason?: string;
   model?: string;
   chatTemplate?: boolean;
+  modelId?: string;
+  effectiveContext?: number;
+  threads?: number;
+  batch?: number;
+  gpuLayers?: number;
+  gpuAvailable?: boolean;
+  warnings?: string[];
 } = { backend: "cpu" };
 export function localDiagnostics() {
-  return { ...diagnostic, generating };
+  return { ...diagnostic, generating, loaded: Boolean(engine?.isModelLoaded()) };
 }
 
 export function isLoadCancelled(error: unknown): boolean {
@@ -41,11 +49,47 @@ export type RuntimePlan = {
   gpuLayers: number;
 };
 
+export function getModelPreflight(
+  model: SavedModel,
+  plan = planRuntime(2048, 512, undefined, model.config),
+) {
+  const nav = typeof navigator === "undefined" ? null : navigator;
+  const reportedMemory = (nav as (Navigator & { deviceMemory?: number }) | null)?.deviceMemory;
+  // An estimate, not a measurement: model weights + runtime and approximate KV workspace.
+  const estimatedMemoryBytes = Math.ceil(model.bytes * 1.25 + plan.ctx * 256 * 1024);
+  const warnings: string[] = [];
+  if (model.bytes >= 4 * 1024 ** 3)
+    warnings.push(
+      "Large browser model: GPU offload still retains weights in system memory. LM Studio or Ollama is recommended if this browser runs out of memory.",
+    );
+  if (reportedMemory && estimatedMemoryBytes > reportedMemory * 1024 ** 3 * 0.75)
+    warnings.push(
+      "Estimated memory exceeds much of the browser-reported RAM. That report may be rounded or capped; close other apps, reduce context/batch, or choose a smaller quantization.",
+    );
+  if (!(typeof crossOriginIsolated === "boolean" && crossOriginIsolated))
+    warnings.push(
+      "This page can use one CPU thread. Multiple threads require a cross-origin-isolated host; native providers can use your available CPU cores.",
+    );
+  if (model.metadata?.contextLength && plan.ctx > model.metadata.contextLength)
+    warnings.push(
+      `Requested context exceeds this model's ${model.metadata.contextLength.toLocaleString()} trained context and may reduce output quality.`,
+    );
+  return {
+    estimatedMemoryBytes,
+    reportedMemoryBytes: reportedMemory ? reportedMemory * 1024 ** 3 : null,
+    warnings,
+  };
+}
+
 export function planRuntime(
   requestedCtx: number,
   requestedTokens: number,
   profile: PerformanceProfile = useKiln.getState().settings.performanceProfile ?? "auto",
+  config?: ModelConfig,
 ): RuntimePlan {
+  profile = config?.profile ?? profile;
+  requestedCtx = config?.context ?? requestedCtx;
+  requestedTokens = config?.maxTokens ?? requestedTokens;
   const nav = typeof navigator === "undefined" ? null : navigator;
   const cores = nav?.hardwareConcurrency || 2;
   const memory = (nav as (Navigator & { deviceMemory?: number }) | null)?.deviceMemory ?? 4;
@@ -53,7 +97,7 @@ export function planRuntime(
   // does not isolate the origin, so extra cores would not actually run.
   const threads =
     typeof crossOriginIsolated === "boolean" && crossOriginIsolated
-      ? Math.min(profile === "quality" ? 8 : 4, Math.max(1, cores - 1))
+      ? Math.min(config?.threads ?? (profile === "quality" ? 8 : 4), Math.max(1, cores))
       : 1;
   const ctxCap =
     profile === "quality"
@@ -65,16 +109,21 @@ export function planRuntime(
           : memory >= 8
             ? 8192
             : 4096;
-  const ctx = Math.max(512, Math.min(requestedCtx, ctxCap));
+  const ctx = Math.max(512, Math.min(requestedCtx, config?.context ? 131072 : ctxCap));
   const maxTokens = Math.max(16, Math.min(requestedTokens, profile === "saver" ? 512 : ctx - 128));
   const gpuLayers =
     profile !== "saver" && !gpuFailed && !!nav && "gpu" in nav
-      ? profile === "quality"
-        ? 99999
-        : 16
+      ? Math.max(0, Math.min(config?.gpuLayers ?? (profile === "quality" ? 99999 : 16), 99999))
       : 0;
-  const note = `${gpuLayers ? "WebGPU with CPU fallback" : "CPU"} · ${threads} thread${threads > 1 ? "s" : ""} · ${ctx.toLocaleString()} context. ${gpuFailed ? "A GPU failure was detected this session." : threads === 1 ? "More CPU threads require cross-origin isolation." : ""}`;
-  return { threads, batch: profile === "saver" ? 64 : 128, ctx, maxTokens, note, gpuLayers };
+  const note = `${gpuLayers ? "GPU offload requested (verified during load)" : "CPU selected"}, ${threads} thread${threads > 1 ? "s" : ""}, ${ctx.toLocaleString()} context`;
+  return {
+    threads,
+    batch: Math.max(16, Math.min(config?.batch ?? (profile === "saver" ? 64 : 128), 2048)),
+    ctx,
+    maxTokens,
+    note,
+    gpuLayers,
+  };
 }
 
 async function getEngine(): Promise<Engine> {
@@ -93,6 +142,8 @@ export async function unloadLocal(): Promise<void> {
   ticket += 1;
   loadedKey = "";
   inflight = null;
+  loadedConfig = undefined;
+  diagnostic = { backend: "cpu" };
   const current = engine;
   engine = null;
   if (current) await current.exit().catch(() => undefined);
@@ -106,9 +157,12 @@ export function ensureLocal(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) return Promise.reject(new LoadCancelled());
-  const plan = planRuntime(nCtx, 512, profile);
-  const key = `${model.id}:${plan.ctx}:${plan.threads}:${plan.gpuLayers}`;
-  if (engine?.isModelLoaded() && loadedKey === key) return Promise.resolve();
+  const plan = planRuntime(nCtx, 512, profile, model.config);
+  const key = `${model.id}:${plan.ctx}:${plan.threads}:${plan.gpuLayers}:${plan.batch}`;
+  if (engine?.isModelLoaded() && loadedKey === key) {
+    loadedConfig = model.config;
+    return Promise.resolve();
+  }
   if (inflight?.key === key) return cancellableLoad(inflight.promise, signal);
   const mine = ++ticket;
   const promise = chain.then(() => runLoad(model, plan, key, mine, onProgress));
@@ -153,6 +207,8 @@ async function runLoad(
     loadedKey = "";
   }
   if (mine !== ticket) throw new LoadCancelled();
+  loadedConfig = undefined;
+  diagnostic = { backend: "cpu", model: model.name, modelId: model.id };
   const current = await getEngine();
   const params = {
     n_ctx: plan.ctx,
@@ -178,28 +234,71 @@ async function runLoad(
       );
     else await runtime.loadModelFromUrl(model.url, { ...params, n_gpu_layers: gpuLayers });
   };
+  let runtime = current;
+  let gpuLayers = plan.gpuLayers;
+  let reason: string | undefined;
+  let gpuAvailable = false;
+  if (gpuLayers) {
+    try {
+      const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+      gpuAvailable = Boolean(await gpu?.requestAdapter());
+    } catch {
+      gpuAvailable = false;
+    }
+    if (!gpuAvailable) {
+      gpuLayers = 0;
+      reason = "No usable WebGPU adapter; loaded on CPU.";
+    }
+  }
   try {
-    await load(current, plan.gpuLayers);
-    diagnostic = {
-      backend: plan.gpuLayers && current.isSupportWebGPU() ? "webgpu-requested" : "cpu",
-      model: model.name,
-      chatTemplate: Boolean(current.getChatTemplate()),
-    };
+    await load(runtime, gpuLayers);
   } catch (error) {
     if (mine !== ticket) throw new LoadCancelled();
-    if (!plan.gpuLayers) throw error;
+    if (!gpuLayers) {
+      await runtime.exit().catch(() => undefined);
+      engine = null;
+      loadedKey = "";
+      throw new Error(
+        `Could not load ${model.name}: ${error instanceof Error ? error.message : "runtime load failed"}. Try a smaller model or use LM Studio/Ollama for large models.`,
+      );
+    }
     gpuFailed = true;
-    diagnostic = {
-      backend: "cpu",
-      model: model.name,
-      reason: error instanceof Error ? error.message.slice(0, 300) : "GPU load failed",
-    };
-    await current.exit().catch(() => undefined);
+    reason = `GPU load failed; CPU fallback used. ${error instanceof Error ? error.message.slice(0, 200) : ""}`;
+    await runtime.exit().catch(() => undefined);
     engine = null;
     onProgress("GPU unavailable; trying CPU", null);
-    await load(await getEngine(), 0);
+    runtime = await getEngine();
+    gpuLayers = 0;
+    try {
+      await load(runtime, 0);
+    } catch (error) {
+      await runtime.exit().catch(() => undefined);
+      engine = null;
+      loadedKey = "";
+      throw error;
+    }
   }
   if (mine !== ticket) throw new LoadCancelled();
+  if (!runtime.isModelLoaded())
+    throw new Error(
+      "The runtime did not confirm a loaded model. Try a compatible GGUF or a native provider.",
+    );
+  const context = runtime.getLoadedContextInfo();
+  diagnostic = {
+    // Wllama exposes requested layers, not a confirmed tensor allocation count.
+    backend: gpuLayers && runtime.isSupportWebGPU() ? "webgpu-requested" : "cpu",
+    reason,
+    gpuAvailable,
+    gpuLayers,
+    model: model.name,
+    modelId: model.id,
+    effectiveContext: context.n_ctx,
+    batch: context.n_batch,
+    threads: runtime.getNumThreads(),
+    chatTemplate: Boolean(runtime.getChatTemplate()),
+    warnings: getModelPreflight(model, plan).warnings,
+  };
+  loadedConfig = model.config;
   loadedKey = key;
   onProgress("Ready", 1);
 }
@@ -224,12 +323,15 @@ export async function completeLocal(
     await engine.createChatCompletion({
       messages,
       stream: true,
-      temperature,
-      max_tokens: maxTokens,
+      temperature: loadedConfig?.temperature ?? temperature,
+      max_tokens: Math.min(
+        loadedConfig?.maxTokens ?? maxTokens,
+        (diagnostic.effectiveContext ?? 2048) - 128,
+      ),
       top_k: 40,
-      top_p: 0.9,
+      top_p: loadedConfig?.topP ?? 0.9,
       min_p: 0.05,
-      penalty_repeat: 1.15,
+      penalty_repeat: loadedConfig?.repeatPenalty ?? 1.15,
       penalty_last_n: 128,
       abortSignal: controller.signal,
       onData: (chunk) => {
@@ -273,8 +375,13 @@ export async function localToolTurn(
     return await engine.createChatCompletion({
       messages,
       tools,
-      temperature,
-      max_tokens: maxTokens,
+      temperature: loadedConfig?.temperature ?? temperature,
+      max_tokens: Math.min(
+        loadedConfig?.maxTokens ?? maxTokens,
+        (diagnostic.effectiveContext ?? 2048) - 128,
+      ),
+      top_p: loadedConfig?.topP ?? 0.9,
+      penalty_repeat: loadedConfig?.repeatPenalty ?? 1.15,
       abortSignal: signal,
     });
   } finally {

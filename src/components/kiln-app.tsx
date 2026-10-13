@@ -44,7 +44,13 @@ import {
   saveMedia,
   saveModel,
 } from "@/lib/library";
-import { ensureLocal, isLoadCancelled, planRuntime, unloadLocal } from "@/lib/local-engine";
+import {
+  ensureLocal,
+  isLoadCancelled,
+  localDiagnostics,
+  planRuntime,
+  unloadLocal,
+} from "@/lib/local-engine";
 import { copyText, downloadText } from "@/lib/preview-doc";
 import { useKiln, threadMode } from "@/lib/store";
 import { composeAttachmentText, prepareFile, type PreparedFile } from "@/lib/attachments";
@@ -88,6 +94,12 @@ const CHAT_STARTERS = [
 function clipTitle(text: string): string {
   const line = text.trim().split("\n")[0] || "New chat";
   return line.length > 48 ? `${line.slice(0, 48)}…` : line;
+}
+
+function runtimeSummary(): string {
+  const actual = localDiagnostics();
+  const backend = actual.backend === "cpu" ? "CPU" : "GPU offload requested";
+  return `${actual.effectiveContext?.toLocaleString() ?? "Unknown"} context · ${actual.threads ?? 1} CPU thread${actual.threads === 1 ? "" : "s"} · batch ${actual.batch ?? "auto"} · ${backend}${actual.reason ? ` (${actual.reason})` : ""}`;
 }
 
 export function KilnApp() {
@@ -151,6 +163,13 @@ export function KilnApp() {
       })
       .catch((error) => setStorageError(`Workspace recovery failed: ${explain(error)}`));
     void refreshModels();
+    const onModelsChanged = () => {
+      void refreshModels();
+      void folderLabel()
+        .then(setModelFolder)
+        .catch(() => undefined);
+    };
+    window.addEventListener("kiln-models-changed", onModelsChanged);
     void folderLabel()
       .then(setModelFolder)
       .catch(() => undefined);
@@ -171,6 +190,7 @@ export function KilnApp() {
     }
     return () => {
       window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("kiln-models-changed", onModelsChanged);
       window.removeEventListener("kiln-storage-error", onStorageError);
       display.removeEventListener("change", syncDisplay);
     };
@@ -220,8 +240,8 @@ export function KilnApp() {
   async function refreshModels() {
     try {
       setModels(await listModels());
-    } catch {
-      setModels([]);
+    } catch (error) {
+      setLoad({ phase: "error", message: `Cannot refresh the model library: ${explain(error)}` });
     }
   }
 
@@ -231,8 +251,11 @@ export function KilnApp() {
   }
 
   async function activate(model: SavedModel) {
-    kiln.setLocalModelId(model.id);
-    setPanel(null);
+    if (busy) {
+      setFileNote("Stop the current response before changing the loaded model.");
+      return;
+    }
+    downloadAbort.current?.abort();
     const controller = new AbortController();
     downloadAbort.current = controller;
     setLoad({ phase: "loading", label: "Starting", ratio: null });
@@ -242,18 +265,22 @@ export function KilnApp() {
         ready,
         useKiln.getState().settings.localCtx,
         (label, ratio) => {
-          setLoad({ phase: "loading", label, ratio });
+          if (downloadAbort.current === controller) setLoad({ phase: "loading", label, ratio });
         },
         undefined,
         controller.signal,
       );
+      controller.signal.throwIfAborted();
+      if (downloadAbort.current !== controller) return;
       setLoad({
         phase: "ready",
         name: ready.name,
-        note: planRuntime(useKiln.getState().settings.localCtx, 512).note,
+        note: runtimeSummary(),
       });
+      kiln.setLocalModelId(ready.id);
       await refreshModels();
     } catch (error) {
+      if (downloadAbort.current !== controller) return;
       if (isAbort(error) || isLoadCancelled(error)) {
         setLoad({ phase: "idle" });
         return;
@@ -284,6 +311,7 @@ export function KilnApp() {
       opfsName: placed.opfsName,
       externalName: placed.externalName || undefined,
       where: placed.where,
+      folderKey: placed.folderKey,
     };
     await saveModel(next);
     return next;
@@ -434,7 +462,19 @@ export function KilnApp() {
       mode === "chat"
         ? settings.chatPrompt?.trim() || CHAT_SYSTEM
         : settings.systemPrompt.trim() || DEFAULT_SYSTEM;
-    const maxChars = state.activeId === "local" ? Math.max(1800, settings.localCtx * 3) : 100_000;
+    const selectedLocal = models.find((model) => model.id === state.localModelId);
+    const maxChars =
+      state.activeId === "local"
+        ? Math.max(
+            1800,
+            planRuntime(
+              settings.localCtx,
+              settings.maxTokens,
+              settings.performanceProfile,
+              selectedLocal?.config,
+            ).ctx * 3,
+          )
+        : 100_000;
     const messages = fitMessages(
       [{ role: "system" as const, content: system }, ...history],
       maxChars,
@@ -499,7 +539,12 @@ export function KilnApp() {
         );
         if (!saved) throw new Error("Choose a model on this device first.");
         const installed = await materialize(saved, controller.signal);
-        const plan = planRuntime(settings.localCtx, settings.maxTokens);
+        const plan = planRuntime(
+          settings.localCtx,
+          settings.maxTokens,
+          settings.performanceProfile,
+          installed.config,
+        );
         await ensureLocal(
           installed,
           plan.ctx,
@@ -507,7 +552,7 @@ export function KilnApp() {
           settings.performanceProfile,
           controller.signal,
         );
-        setLoad({ phase: "ready", name: saved.name, note: plan.note });
+        setLoad({ phase: "ready", name: saved.name, note: runtimeSummary() });
         await completeLocalWithTools(
           messages.map(({ role, content }) => ({ role, content })),
           settings.temperature,
@@ -646,7 +691,7 @@ export function KilnApp() {
       : load.phase === "error"
         ? load.message
         : load.phase === "ready"
-          ? `${load.name} is ready. ${load.note}`
+          ? `${load.name} · Loaded for chat`
           : "";
 
   const canDraw = Boolean(
@@ -1278,19 +1323,28 @@ export function KilnApp() {
               models={models}
               activeId={kiln.localModelId}
               load={load}
+              generationBusy={busy}
               onUse={(model) => void activate(model)}
-              onChanged={() => void refreshModels()}
+              onChanged={() => {
+                void refreshModels();
+                void folderLabel()
+                  .then(setModelFolder)
+                  .catch(() => undefined);
+              }}
               folder={modelFolder}
               onFolder={async () => {
                 try {
                   const name = await rememberFolder();
                   setModelFolder(name);
                 } catch (error) {
+                  if (isAbort(error)) return;
                   setLoad({ phase: "error", message: explain(error) });
                 }
               }}
               onUnload={() => {
+                if (busy) return;
                 downloadAbort.current?.abort();
+                downloadAbort.current = null;
                 void unloadLocal();
                 setLoad({ phase: "idle" });
               }}
